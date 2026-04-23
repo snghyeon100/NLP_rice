@@ -1,0 +1,25 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Core stack (CUDA 12.1 wheels; works on CUDA 12.2 driver)
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+transformers @ git+https://github.com/huggingface/transformers.git
+deepspeed==0.15.4
+
+# Training / eval deps
+datasets
+accelerate
+evaluate
+hydra-core
+omegaconf
+peft
+rouge_score
+tqdm
+einops
+packaging
+bitsandbytes
+scipy
+natsort
+matplotlib
+ninja
