@@ -1,0 +1,42 @@
+model_family: qwen3_5_2b
+model_path: null
+tokenizer_path: null
+
+compare_base: true
+base_model_path: Qwen/Qwen3.5-2B-Base
+
+data_path: ./dataset/full_merged_all_10_lang
+output_dir: ./runs/finetune_full_eval
+
+question_key: question
+answer_key: answer
+language_key: language
+
+batch_size: 4
+max_length: 500
+device: cuda
+device_map: null
+dtype: bfloat16
+trust_remote_code: true
+low_cpu_mem_usage: true
+attn_implementation: auto
+overwrite: true
+
+generation:
+  enabled: true
+  batch_size: 4
+  max_new_tokens: 128
+  do_sample: false
+  temperature: null
+  top_p: null
+  num_beams: 1
+
+case_study:
+  enabled: true
+  seed: 42
+  num_best_per_language: 2
+  num_worst_per_language: 1
+  num_improved_per_language: 2
+  num_random_per_language: 1
+  max_total: null
+
