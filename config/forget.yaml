@@ -32,6 +32,24 @@ eval_while_train: false
 eval_only: false
 seed: 42
 
+wandb:
+  enabled: false
+  entity: changwoolabs
+  project: multilingual-amnesia
+  name: null
+  group: null
+  tags: []
+  mode: online
+
+mcsu:
+  enabled: false
+  subspace_path: null
+  gamma: 1.0
+  layer_ids: null
+  prompt_max_length: 256
+  control_source: retain
+  eps: 1e-8
+
 
 
 eval:

@@ -9,6 +9,7 @@ import copy
 import json 
 from pathlib import Path
 from data_module import get_batch_loss 
+from mcsu_utils import last_nonpad_pool
 from utils import merge_dicts, interleave_eval_result_dict, get_forget_quality, get_model_utility
 import numpy as np
 from scipy.stats import ks_2samp, hmean
@@ -46,14 +47,63 @@ class CustomTrainerForgetting(Trainer):
         self.oracle_model = kwargs.pop('oracle_model')
         self.eval_cfg = kwargs.pop('eval_cfg')
         self.tokenizer = kwargs.pop('tokenizer', None)
+        self.mcsu_enabled = kwargs.pop('mcsu_enabled', False)
+        self.mcsu_subspace_path = kwargs.pop('mcsu_subspace_path', None)
+        self.mcsu_gamma = kwargs.pop('mcsu_gamma', 1.0)
+        self.mcsu_layer_ids = kwargs.pop('mcsu_layer_ids', None)
+        self.mcsu_eps = kwargs.pop('mcsu_eps', 1e-8)
+        self.U_shared = {}
         self.alpha = alpha
         self.gamma = gamma
         self.beta = kwargs.pop('beta')
+        self.train_device = None
+        self.oracle_device = None
+        if self.mcsu_enabled:
+            self._load_mcsu_subspace()
         super(CustomTrainerForgetting, self).__init__(*args, **kwargs)
 
         if self.loss_type == "grad_diff_KL" or self.loss_type == "npo":
             self.oracle_model.eval()
+        if self.model is not None:
+            self.train_device = next(self.model.parameters()).device
+        if self.oracle_model is not None:
+            self.oracle_device = next(self.oracle_model.parameters()).device
         #     self.oracle_model = self._create_oracle_model(oracle_model)
+
+    def _load_mcsu_subspace(self):
+        if not self.mcsu_subspace_path:
+            raise ValueError("mcsu_enabled=True requires mcsu_subspace_path.")
+        if not os.path.exists(self.mcsu_subspace_path):
+            raise FileNotFoundError(f"MCSU subspace file not found: {self.mcsu_subspace_path}")
+
+        try:
+            subspace_obj = torch.load(self.mcsu_subspace_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            subspace_obj = torch.load(self.mcsu_subspace_path, map_location="cpu")
+
+        raw_u_shared = subspace_obj.get("U_shared")
+        if raw_u_shared is None:
+            raise KeyError(f"MCSU subspace file {self.mcsu_subspace_path} does not contain 'U_shared'.")
+
+        available_u = {int(layer): basis for layer, basis in raw_u_shared.items()}
+        if self.mcsu_layer_ids is None:
+            self.mcsu_layer_ids = [int(layer) for layer in subspace_obj.get("layer_ids", available_u.keys())]
+        elif isinstance(self.mcsu_layer_ids, str):
+            if self.mcsu_layer_ids.lower() in {"none", "null", ""}:
+                self.mcsu_layer_ids = [int(layer) for layer in subspace_obj.get("layer_ids", available_u.keys())]
+            else:
+                self.mcsu_layer_ids = [int(layer.strip()) for layer in self.mcsu_layer_ids.split(",") if layer.strip()]
+        else:
+            self.mcsu_layer_ids = [int(layer) for layer in self.mcsu_layer_ids]
+
+        for layer in self.mcsu_layer_ids:
+            if layer not in available_u:
+                raise KeyError(
+                    f"MCSU subspace for layer {layer} is missing. "
+                    f"Available layers: {sorted(available_u.keys())}"
+                )
+            self.U_shared[layer] = available_u[layer].detach().float().cpu()
+            self.U_shared[layer].requires_grad_(False)
 
     def _wrap_model(self, model, training=True, dataloader=None):
         # The forgetting pipeline manually places the train model on cuda:0 and the
@@ -108,7 +158,66 @@ class CustomTrainerForgetting(Trainer):
         return model
     
 
+    def compute_mcsu_loss(self, model, mcsu_forget_inputs, mcsu_control_inputs):
+        device = next(model.parameters()).device
+        forget_input_ids, forget_attention_mask = mcsu_forget_inputs
+        control_input_ids, control_attention_mask = mcsu_control_inputs
+        forget_input_ids = forget_input_ids.to(device)
+        forget_attention_mask = forget_attention_mask.to(device)
+        control_input_ids = control_input_ids.to(device)
+        control_attention_mask = control_attention_mask.to(device)
+
+        outputs_f = model(
+            input_ids=forget_input_ids,
+            attention_mask=forget_attention_mask,
+            output_hidden_states=True,
+        )
+        outputs_c = model(
+            input_ids=control_input_ids,
+            attention_mask=control_attention_mask,
+            output_hidden_states=True,
+        )
+        if outputs_f.hidden_states is None or outputs_c.hidden_states is None:
+            raise ValueError("Model did not return hidden states. MCSU requires output_hidden_states=True.")
+
+        layer_losses = []
+        for layer in self.mcsu_layer_ids:
+            hidden_idx = layer + 1
+            if hidden_idx >= len(outputs_f.hidden_states):
+                raise ValueError(
+                    f"MCSU layer {layer} is out of range for model hidden_states length "
+                    f"{len(outputs_f.hidden_states)}."
+                )
+            h_f = last_nonpad_pool(outputs_f.hidden_states[hidden_idx], forget_attention_mask)
+            h_c = last_nonpad_pool(outputs_c.hidden_states[hidden_idx], control_attention_mask)
+            z = h_f - h_c
+            U = self.U_shared[layer].to(device=z.device, dtype=z.dtype)
+            if U.shape[0] != z.shape[-1]:
+                raise ValueError(
+                    f"MCSU subspace hidden dim {U.shape[0]} does not match model hidden dim {z.shape[-1]} "
+                    f"for layer {layer}."
+                )
+            proj = z @ U
+            num = (proj ** 2).sum(dim=-1)
+            den = (z ** 2).sum(dim=-1) + self.mcsu_eps
+            layer_losses.append((num / den).mean())
+
+        return torch.stack(layer_losses).mean()
+
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        outputs = None
+        mcsu_forget_inputs, mcsu_control_inputs = None, None
+        if self.mcsu_enabled:
+            if len(inputs) < 4:
+                raise ValueError(
+                    "MCSU batches must contain existing loss inputs plus "
+                    "mcsu_forget_prompt_inputs and mcsu_control_prompt_inputs."
+                )
+            mcsu_forget_inputs = inputs[-2]
+            mcsu_control_inputs = inputs[-1]
+            inputs = inputs[:-2]
+
         if self.loss_type == "grad_ascent":
             forget_inputs, retain_inputs = inputs
             input_ids, labels, attention_mask = forget_inputs
@@ -149,18 +258,22 @@ class CustomTrainerForgetting(Trainer):
             current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
             
             with torch.no_grad():
-                normal_outputs = self.oracle_model(normal_input_ids.to("cuda:1"),labels=normal_labels.to("cuda:1"), attention_mask=normal_attention_mask.to("cuda:1"))
+                normal_outputs = self.oracle_model(
+                    normal_input_ids.to(self.oracle_device),
+                    labels=normal_labels.to(self.oracle_device),
+                    attention_mask=normal_attention_mask.to(self.oracle_device),
+                )
             normal_probs = F.log_softmax(normal_outputs.logits, dim=-1)
             normal_probs = normal_probs.view(-1, normal_outputs.logits.shape[-1])
 
             #minimum KL divergence
-            normal_loss = nn.functional.kl_div(current_probs, normal_probs.to("cuda:0"), reduction='batchmean', log_target=True)
+            normal_loss = nn.functional.kl_div(current_probs, normal_probs.to(current_probs.device), reduction='batchmean', log_target=True)
             loss += normal_loss
         
         elif self.loss_type == "npo":
             forget_inputs, retain_inputs = inputs
 
-            forget_loss, forget_outputs = compute_dpo_loss(
+            forget_loss, outputs = compute_dpo_loss(
                 model=model,
                 ref_model=self.oracle_model,
                 win_inputs=None,
@@ -184,12 +297,16 @@ class CustomTrainerForgetting(Trainer):
             current_probs = current_probs.view(-1, current_outputs.logits.shape[-1])
             
             with torch.no_grad():
-                retain_outputs = self.oracle_model(retain_input_ids.to("cuda:1"),labels=retain_labels.to("cuda:1"), attention_mask=retain_attention_mask.to("cuda:1"))
+                retain_outputs = self.oracle_model(
+                    retain_input_ids.to(self.oracle_device),
+                    labels=retain_labels.to(self.oracle_device),
+                    attention_mask=retain_attention_mask.to(self.oracle_device),
+                )
             retain_probs = F.log_softmax(retain_outputs.logits, dim=-1)
             retain_probs = retain_probs.view(-1, retain_outputs.logits.shape[-1])
 
             #minimum KL divergence
-            retain_loss = nn.functional.kl_div(current_probs, retain_probs.to("cuda:0"), reduction='batchmean', log_target=True)
+            retain_loss = nn.functional.kl_div(current_probs, retain_probs.to(current_probs.device), reduction='batchmean', log_target=True)
             loss = forget_loss + retain_loss
 
         elif self.loss_type == "idk":
@@ -232,6 +349,16 @@ class CustomTrainerForgetting(Trainer):
             loss = -F.logsigmoid(beta * (pi_logratios - ref_logratios)).mean()
 
             outputs = forget_outputs
+        else:
+            raise ValueError(f"Unsupported forget_loss: {self.loss_type}")
+
+        if self.mcsu_enabled and float(self.mcsu_gamma) != 0.0:
+            loss_mcsu = self.compute_mcsu_loss(model, mcsu_forget_inputs, mcsu_control_inputs)
+            loss = loss + self.mcsu_gamma * loss_mcsu
+            try:
+                self.log({"loss_mcsu": loss_mcsu.detach().float().item()})
+            except Exception:
+                pass
         
         return (loss, outputs) if return_outputs else loss
         
@@ -311,7 +438,18 @@ class CustomTrainerForgetting(Trainer):
                     print(f"Skipping {eval_task} because {save_filename} already exists")
                     continue
 
-                eval_dataloader, base_eval_dataloader, perturb_dataloader = get_dataloader(eval_cfg, eval_task, self.tokenizer, folder, split, question_key, answer_key, base_answer_key, perturbed_answer_key)
+                eval_dataloader, base_eval_dataloader, perturb_dataloader = get_dataloader(
+                    eval_cfg,
+                    eval_task,
+                    self.tokenizer,
+                    folder,
+                    split,
+                    question_key,
+                    answer_key,
+                    base_answer_key,
+                    perturbed_answer_key,
+                    language=eval_cfg.language,
+                )
                 eval_dataloader = self.accelerator.prepare(eval_dataloader)
                 base_eval_dataloader = self.accelerator.prepare(base_eval_dataloader)
                 perturb_dataloader = self.accelerator.prepare(perturb_dataloader)
@@ -441,6 +579,31 @@ def custom_data_collator_forget_kl(samples):
         labels = [s[1] for s in data]
         attention_mask = [s[2] for s in data]
         rets.append((torch.stack(input_ids), torch.stack(labels), torch.stack(attention_mask)))
+    return rets
+
+
+def custom_data_collator_forget_mcsu(samples):
+    if len(samples[0]) < 4:
+        raise ValueError(
+            "MCSU samples must contain existing forget/retain inputs plus "
+            "mcsu_forget_prompt_inputs and mcsu_control_prompt_inputs."
+        )
+
+    rets = []
+    num_existing_inputs = len(samples[0]) - 2
+    for input_pos in range(num_existing_inputs):
+        data = [sample[input_pos] for sample in samples]
+        input_ids = [s[0] for s in data]
+        labels = [s[1] for s in data]
+        attention_mask = [s[2] for s in data]
+        rets.append((torch.stack(input_ids), torch.stack(labels), torch.stack(attention_mask)))
+
+    for input_pos in [num_existing_inputs, num_existing_inputs + 1]:
+        data = [sample[input_pos] for sample in samples]
+        input_ids = [s[0] for s in data]
+        attention_mask = [s[1] for s in data]
+        rets.append((torch.stack(input_ids), torch.stack(attention_mask)))
+
     return rets
 
 def compute_metrics(pred):

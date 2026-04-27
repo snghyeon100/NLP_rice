@@ -29,3 +29,6 @@ upload_to_hf.py
 # Logs
 *.log
 eval_logs/
+
+runs/
+.codex
