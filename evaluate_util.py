@@ -3,111 +3,16 @@ from data_module import TextDatasetQAStat, custom_data_collator, get_batch_loss,
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import os, hydra
-import importlib.util
 import evaluate
 import json
-import re
 from pathlib import Path
 from rouge_score import rouge_scorer
-from mcsu_eval_summary import summarize_task
 from utils import get_model_identifiers_from_yaml, get_model_utility, get_forget_quality
 import torch.nn as nn
 import csv 
 import numpy as np 
-from omegaconf import OmegaConf
 
 from evaluate import load
-
-
-def _cfg_get(section, key, default=None):
-    if section is None:
-        return default
-    return section[key] if key in section and section[key] is not None else default
-
-
-def _sanitize_wandb_name(value):
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-") or "eval"
-
-
-def setup_wandb_eval(cfg):
-    wandb_cfg = cfg.get("wandb", {})
-    enabled = bool(_cfg_get(wandb_cfg, "enabled", False))
-    if not enabled:
-        os.environ["WANDB_DISABLED"] = "true"
-        return None, None
-
-    if importlib.util.find_spec("wandb") is None:
-        raise ImportError("wandb.enabled=true requires the wandb package. Install it with `pip install wandb`.")
-
-    import wandb
-
-    os.environ.pop("WANDB_DISABLED", None)
-    entity = str(_cfg_get(wandb_cfg, "entity", "changwoolabs"))
-    project = str(_cfg_get(wandb_cfg, "project", "multilingual-amnesia"))
-    mode = str(_cfg_get(wandb_cfg, "mode", "online"))
-    run_name = _cfg_get(wandb_cfg, "name", None)
-    if run_name is None:
-        model_name = Path(str(cfg.model_path).rstrip("/")).name or str(cfg.model_family)
-        run_name = f"eval_{model_name}_{cfg.language}"
-
-    tags = _cfg_get(wandb_cfg, "tags", [])
-    tags = [str(tag) for tag in tags] if tags else []
-    group = _cfg_get(wandb_cfg, "group", None)
-    config = OmegaConf.to_container(cfg, resolve=True)
-    run = wandb.init(
-        entity=entity,
-        project=project,
-        name=str(run_name),
-        group=str(group) if group else None,
-        tags=tags,
-        mode=mode,
-        config=config,
-    )
-    return wandb, run
-
-
-def _is_number(value):
-    return isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value)
-
-
-def _collect_numbers(value):
-    if _is_number(value):
-        return [float(value)]
-    if isinstance(value, dict):
-        numbers = []
-        for nested_value in value.values():
-            numbers.extend(_collect_numbers(nested_value))
-        return numbers
-    if isinstance(value, (list, tuple)):
-        numbers = []
-        for nested_value in value:
-            numbers.extend(_collect_numbers(nested_value))
-        return numbers
-    return []
-
-
-def _looks_like_per_example_dict(value):
-    if not isinstance(value, dict) or len(value) < 20:
-        return False
-    numeric_like_keys = 0
-    for key in value.keys():
-        try:
-            int(key)
-            numeric_like_keys += 1
-        except (TypeError, ValueError):
-            pass
-    return numeric_like_keys / max(1, len(value)) > 0.8
-
-
-def summarize_eval_logs(eval_task, eval_logs):
-    summary = summarize_task(eval_task, eval_logs)
-    task = re.sub(r"[^A-Za-z0-9_.-]+", "_", summary["task"].lower())
-    metrics = {}
-    for key, value in summary.items():
-        if key == "task" or value is None:
-            continue
-        metrics[f"eval/{task}/{key}"] = value
-    return metrics
 
 
 
@@ -241,12 +146,11 @@ def get_dataloader(cfg, eval_task, tokenizer, folder, split, question_key, answe
     eval_dataloader = torch.utils.data.DataLoader(
         torch_format_dataset, batch_size=cfg.batch_size, collate_fn=custom_data_collator_with_indices
     )
-    perturb_batch_size = max(1, cfg.batch_size // 4)
     base_eval_dataloader = torch.utils.data.DataLoader(
-        base_torch_format_dataset, batch_size=perturb_batch_size, collate_fn=custom_data_collator_with_indices
+        base_torch_format_dataset, batch_size=cfg.batch_size//4, collate_fn=custom_data_collator_with_indices
     )
     perturb_dataloader = torch.utils.data.DataLoader(
-        perturb_torch_format_dataset, batch_size=perturb_batch_size, collate_fn=custom_data_collator_with_indices
+        perturb_torch_format_dataset, batch_size=cfg.batch_size//4, collate_fn=custom_data_collator_with_indices
     )
 
     return eval_dataloader, base_eval_dataloader, perturb_dataloader
@@ -328,13 +232,12 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
 def main(cfg):
     assert len(cfg.data_path)==len(cfg.split_list)==len(cfg.eval_task)==len(cfg.question_key)==len(cfg.answer_key)==len(cfg.base_answer_key)==len(cfg.perturbed_answer_key), "data_path, split, eval_task, question_key, and answer_key must be the same length"
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
-    wandb_module, wandb_run = setup_wandb_eval(cfg)
-    wandb_artifact_files = []
 
     if os.environ.get('LOCAL_RANK') is not None:
         local_rank = int(os.environ.get('LOCAL_RANK', '0'))
         device_map = {'': local_rank}
 
+    os.environ["WANDB_DISABLED"] = "true"
     model_cfg = get_model_identifiers_from_yaml(cfg.model_family)
     model_id = model_cfg["hf_key"]
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -398,9 +301,6 @@ def main(cfg):
         with open(save_filename, "w") as f:
             # pretty write json to f
             json.dump(eval_logs, f, indent=4)
-        wandb_artifact_files.append(save_filename)
-        if wandb_run is not None:
-            wandb_module.log(summarize_eval_logs(eval_task, eval_logs))
 
         aggregated_eval_logs[f'{eval_task}.json'] = eval_logs
 
@@ -409,17 +309,6 @@ def main(cfg):
     with open(aggregated_eval_log_filename, "w") as f:
         # pretty write json to f
         json.dump(aggregated_eval_logs, f, indent=4)
-    wandb_artifact_files.append(aggregated_eval_log_filename)
-
-    if wandb_run is not None:
-        if bool(_cfg_get(cfg.get("wandb", {}), "log_artifacts", True)):
-            artifact_name = _sanitize_wandb_name(f"{wandb_run.name}-{Path(cfg.save_dir).name}-eval-results")
-            artifact = wandb_module.Artifact(artifact_name, type="evaluation")
-            for filename in wandb_artifact_files:
-                if os.path.exists(filename):
-                    artifact.add_file(filename)
-            wandb_module.log_artifact(artifact)
-        wandb_module.finish()
                     
 
 def eval_accuracy(logits, labels):
@@ -511,3 +400,4 @@ def eval_rouge_recall(gen_outputs, ground_truths, indices):
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float32)
     main()
+
