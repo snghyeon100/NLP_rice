@@ -1,5 +1,5 @@
 model_family: aya-expanse-8B
-model_path: ../scratch/tofu_finetuned_5epoch_aya_10_lang_2e5/
+model_path: ./finetuned
 
 lr: 2e-5
 

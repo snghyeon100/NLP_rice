@@ -1,5 +1,5 @@
 model_family: qwen3_5_2b
-model_path: ../scratch/tofu_finetuned_5epoch_qwen3_5_2b_base_2e5/
+model_path: ./finetuned
 
 
 lr: 2e-5

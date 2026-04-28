@@ -55,6 +55,5 @@ qwen3_5_2b:
     ru: "Ответ: "         # Russian
   flash_attention2: "false"
   gradient_checkpointing: "true"
-  ft_model_path: "../scratch/tofu_ft_qwen3_5_2b"
+  ft_model_path: "./finetuned"
   use_chat_template: "true"
-

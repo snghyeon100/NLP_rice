@@ -43,11 +43,12 @@ def main(cfg):
     model_cfg = get_model_identifiers_from_yaml(cfg.model_family)
     model_id = model_cfg["hf_key"]
 
-    Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
+    save_dir = to_absolute_path(cfg.save_dir)
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
     # save the cfg file
 
     if os.environ.get('LOCAL_RANK') is None or local_rank == 0:
-        with open(f'{cfg.save_dir}/cfg.yaml', 'w') as f:
+        with open(Path(save_dir) / 'cfg.yaml', 'w') as f:
             OmegaConf.save(cfg, f)
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -66,7 +67,6 @@ def main(cfg):
     max_steps = int(cfg.num_epochs*len(torch_format_dataset))//(batch_size*gradient_accumulation_steps*num_devices)
     # max_steps=5
     print(f"max_steps: {max_steps}")
-    save_dir = to_absolute_path(cfg.save_dir)
     Path(save_dir).mkdir(parents=True, exist_ok=True)
     training_args = transformers.TrainingArguments(
             per_device_train_batch_size=batch_size,
@@ -78,7 +78,7 @@ def main(cfg):
             bf16=True,
             bf16_full_eval=True,
             logging_steps=max(1,max_steps//40),
-            logging_dir=f'{cfg.save_dir}/logs',
+            logging_dir=str(Path(save_dir) / 'logs'),
             output_dir=save_dir,
             optim="paged_adamw_32bit",
             save_steps=300,
@@ -121,9 +121,9 @@ def main(cfg):
         trainer.train()
 
 
-    trainer.save_model(cfg.save_dir)
+    trainer.save_model(save_dir)
     if trainer.is_world_process_zero():
-        tokenizer.save_pretrained(cfg.save_dir)
+        tokenizer.save_pretrained(save_dir)
 
 if __name__ == "__main__":
     main()

@@ -1,5 +1,5 @@
 model_family: qwen3_5_2b
-model_path: null
+model_path: ./finetuned
 tokenizer_path: null
 prefer_checkpoint_tokenizer: true
 

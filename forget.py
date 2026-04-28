@@ -7,7 +7,17 @@ import hydra
 import transformers
 import os
 from pathlib import Path
+from hydra.utils import to_absolute_path
 from utils import get_model_identifiers_from_yaml
+
+
+def resolve_maybe_local_path(path):
+    if path is None:
+        return None
+    path = str(path)
+    if path.startswith(("./", "../", "/")):
+        return to_absolute_path(path)
+    return path
 
 
 def find_all_linear_names(model):
@@ -50,6 +60,8 @@ def main(cfg):
     model_id = model_cfg["hf_key"]
     if cfg.model_path is None:
         cfg.model_path = model_cfg["ft_model_path"]
+    cfg.model_path = resolve_maybe_local_path(cfg.model_path)
+    cfg.save_dir = to_absolute_path(cfg.save_dir)
 
     print("######################")
     print("Saving to: ", cfg.save_dir)
@@ -78,7 +90,7 @@ def main(cfg):
             bf16=True,
             bf16_full_eval=True,
             logging_steps=max(1,max_steps//20),
-            logging_dir=f'{cfg.save_dir}/logs',
+            logging_dir=str(Path(cfg.save_dir) / "logs"),
             output_dir=cfg.save_dir,
             optim="paged_adamw_32bit",
             save_strategy="steps" if cfg.save_model and (not cfg.eval_only) else "no",

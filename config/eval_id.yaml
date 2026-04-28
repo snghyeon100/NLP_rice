@@ -1,4 +1,4 @@
-model_path: ../scratch/tofu_finetuned_5epoch_qwen3_5_2b_base_2e5/checkpoint-8333/npo_2e-05_forget01_5_en/
+model_path: ./finetuned/checkpoint-8333/npo_2e-05_forget01_5_en/
 model_family: qwen3_5_2b
 language: id
 save_dir: ${model_path}/eval_results/ds_size${ds_size}_${language}
