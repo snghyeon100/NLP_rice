@@ -20,7 +20,7 @@ __pycache__
 *.sh
 paper_models
 notebook/
-
+.DS_Store
 *.ttf
 scripts/
 reproduce.ipynb
