@@ -25,6 +25,7 @@ notebook/
 scripts/
 reproduce.ipynb
 upload_to_hf.py
+TODO.md
 
 # Logs
 *.log
