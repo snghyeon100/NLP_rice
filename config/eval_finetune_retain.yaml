@@ -6,12 +6,13 @@ prefer_checkpoint_tokenizer: true
 compare_base: true
 base_model_path: Qwen/Qwen3.5-2B-Base
 
-data_path: ./dataset/full_merged_all_10_lang
-output_dir: ./runs/finetune_full_eval
+language: hi
+data_path: ./dataset/retain_perturbed_${language}
+output_dir: ./runs/finetune_retain_eval_${language}
 
 question_key: question
 answer_key: answer
-language_key: language
+language_key: null
 unicode_normalization: NFC
 normalize_languages:
   - hi
@@ -20,16 +21,12 @@ match_normalization:
   collapse_whitespace: true
   strip_terminal_punctuation: true
 
-# Enable this when evaluating retain_perturbed_* / forget*_perturbed_* datasets.
-# full_merged_all_10_lang does not include paraphrased_answer or perturbed_answer.
 truth_ratio:
-  enabled: false
+  enabled: true
   correct_answer_key: paraphrased_answer
   perturbed_answer_key: perturbed_answer
   mode: retain
 
-# Full-dataset generation is expensive. Turn this on when you need direct
-# generated-answer exact-match / contains metrics, not only likelihood metrics.
 generation_eval:
   enabled: false
   batch_size: 4
