@@ -71,12 +71,3 @@ reinitialize_weights: false
 
 retain_result: null
 
-wandb:
-  enabled: false
-  entity: changwoolabs
-  project: multilingual-amnesia
-  name: null
-  group: null
-  tags: []
-  mode: online
-  log_artifacts: true
