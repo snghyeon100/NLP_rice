@@ -45,14 +45,14 @@ truth_ratio:
 
 generation_eval:
   enabled: false
-  batch_size: 4
+  batch_size: 1
   max_new_tokens: 128
   do_sample: false
   temperature: null
   top_p: null
   num_beams: 1
 
-batch_size: 4
+batch_size: 1
 max_length: 500
 device: cuda
 device_map: null
@@ -64,7 +64,7 @@ overwrite: true
 
 generation:
   enabled: true
-  batch_size: 4
+  batch_size: 1
   max_new_tokens: 128
   do_sample: false
   temperature: null
