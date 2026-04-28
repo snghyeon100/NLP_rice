@@ -30,3 +30,9 @@ TODO.md
 # Logs
 *.log
 eval_logs/
+
+
+# train results
+finetuned/*
+!finetuned/
+!finetuned/.gitkeep
