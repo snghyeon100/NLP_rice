@@ -120,6 +120,74 @@ def truth_ratio_enabled(cfg):
     return bool(cfg_get(truth_cfg, "enabled", False))
 
 
+def list_cfg(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def format_path_template(template, language):
+    return str(template).format(language=language, lang=language)
+
+
+def plain_config_value(value):
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        return OmegaConf.to_container(value, resolve=True)
+    except Exception:
+        return value
+
+
+def language_data_source(cfg, language):
+    path_by_language = cfg_get(cfg, "data_path_by_language", None)
+    config_by_language = cfg_get(cfg, "data_config_by_language", None)
+    loader_by_language = cfg_get(cfg, "data_loader_by_language", None)
+
+    data_path = cfg_get(path_by_language, language, None)
+    data_config = cfg_get(config_by_language, language, None)
+    data_loader = cfg_get(loader_by_language, language, None)
+
+    if data_path is None:
+        data_path_template = cfg_get(cfg, "data_path_template", None)
+        if data_path_template is None:
+            data_path = cfg.data_path
+        else:
+            data_path = format_path_template(data_path_template, language)
+
+    if data_loader is None:
+        data_loader = "hf" if data_config is not None else "disk"
+
+    return str(data_path), data_config, str(data_loader)
+
+
+def load_dataset_source(data_path, data_config=None, data_loader="disk"):
+    if data_loader == "hf":
+        loaded = datasets.load_dataset(data_path, data_config)
+    elif data_loader == "disk":
+        loaded = datasets.load_from_disk(path_or_model_id(data_path))
+    else:
+        raise ValueError(f"Unsupported data loader: {data_loader}")
+    return loaded["train"] if isinstance(loaded, datasets.DatasetDict) else loaded
+
+
+def data_source_summary(cfg):
+    languages = list_cfg(cfg_get(cfg, "languages", None))
+    data_path_template = cfg_get(cfg, "data_path_template", None)
+    if languages and data_path_template is not None:
+        return {
+            "data_path_template": str(data_path_template),
+            "languages": languages,
+            "data_path_by_language": plain_config_value(cfg_get(cfg, "data_path_by_language", None)),
+            "data_config_by_language": plain_config_value(cfg_get(cfg, "data_config_by_language", None)),
+        }
+    return str(cfg_get(cfg, "data_path", None))
+
+
 def normalize_for_match(text, language, cfg):
     match_cfg = cfg_get(cfg, "match_normalization", None)
     text = normalize_eval_text(str(text), language, cfg)
@@ -154,8 +222,6 @@ def generation_match_metrics(generated, gold, language, cfg):
 
 class FullTofuDataset(Dataset):
     def __init__(self, cfg, tokenizer, model_configs):
-        loaded = datasets.load_from_disk(path_or_model_id(cfg.data_path))
-        self.data = loaded["train"] if isinstance(loaded, datasets.DatasetDict) else loaded
         self.cfg = cfg
         self.tokenizer = tokenizer
         self.model_configs = model_configs
@@ -164,13 +230,52 @@ class FullTofuDataset(Dataset):
         self.answer_key = cfg.answer_key
         self.language_key = cfg_get(cfg, "language_key", "language")
         self.truth_cfg = cfg_get(cfg, "truth_ratio", None)
+        self.items = None
+
+        languages = list_cfg(cfg_get(cfg, "languages", None))
+        data_path_template = cfg_get(cfg, "data_path_template", None)
+        if languages and data_path_template is not None:
+            self.data = None
+            self.items = []
+            for language in languages:
+                data_path, data_config, data_loader = language_data_source(cfg, language)
+                data = load_dataset_source(data_path, data_config, data_loader)
+                for local_idx in range(len(data)):
+                    self.items.append(
+                        {
+                            "row": data[local_idx],
+                            "language": language,
+                            "source_path": data_path,
+                            "source_config": data_config,
+                            "source_loader": data_loader,
+                            "local_index": local_idx,
+                        }
+                    )
+        else:
+            data_config = cfg_get(cfg, "data_config", None)
+            data_loader = cfg_get(cfg, "data_loader", "hf" if data_config is not None else "disk")
+            self.data = load_dataset_source(cfg.data_path, data_config, data_loader)
 
     def __len__(self):
+        if self.items is not None:
+            return len(self.items)
         return len(self.data)
 
+    def row_at(self, idx):
+        if self.items is not None:
+            return self.items[idx]["row"]
+        return self.data[idx]
+
+    def language_at(self, idx, row=None):
+        if self.items is not None:
+            return self.items[idx]["language"]
+        if row is None:
+            row = self.row_at(idx)
+        return get_row_language(row, self.cfg)
+
     def __getitem__(self, idx):
-        row = self.data[idx]
-        language = get_row_language(row, self.cfg)
+        row = self.row_at(idx)
+        language = self.language_at(idx, row)
         question = normalize_eval_text(row[self.question_key], language, self.cfg)
         answer = normalize_eval_text(row[self.answer_key], language, self.cfg)
         input_ids, labels, attention_mask = convert_raw_data_to_model_format(
@@ -181,7 +286,7 @@ class FullTofuDataset(Dataset):
             self.model_configs,
             language=language,
         )
-        return {
+        sample = {
             "index": idx,
             "language": language,
             "question": question,
@@ -447,8 +552,8 @@ def safe_exp(value):
 def merge_records(dataset, ft_results, base_results=None, ft_generation_results=None, base_generation_results=None):
     records = []
     for idx in range(len(dataset)):
-        row = dataset.data[idx]
-        language = get_row_language(row, dataset.cfg)
+        row = dataset.row_at(idx)
+        language = dataset.language_at(idx, row)
         record = {
             "index": idx,
             "language": language,
@@ -699,8 +804,8 @@ def generate_dataset_metrics(model, tokenizer, model_configs, dataset, cfg, mode
     prompts = []
     rows = []
     for idx in range(len(dataset)):
-        row = dataset.data[idx]
-        language = get_row_language(row, dataset.cfg)
+        row = dataset.row_at(idx)
+        language = dataset.language_at(idx, row)
         question = normalize_eval_text(row[dataset.question_key], language, dataset.cfg)
         gold = normalize_eval_text(row[dataset.answer_key], language, dataset.cfg)
         prompts.append(build_prompt(question, language, tokenizer, model_configs))
@@ -942,7 +1047,7 @@ def write_case_study_md(path, summary, per_language_rows, selected_records, comp
             f.write("\n")
 
 
-@hydra.main(version_base=None, config_path="config", config_name="eval_finetune_full")
+@hydra.main(version_base=None, config_path="config", config_name="eval_finetune")
 def main(cfg):
     os.environ["WANDB_DISABLED"] = "true"
     if cfg.model_path is None:
@@ -1006,7 +1111,7 @@ def main(cfg):
         "model_family": cfg.model_family,
         "model_path": str(cfg.model_path),
         "base_model_path": str(cfg.base_model_path) if cfg.compare_base else None,
-        "data_path": str(cfg.data_path),
+        "data_path": data_source_summary(cfg),
         "models": {
             "finetuned": aggregate_records(records, "ft"),
         },

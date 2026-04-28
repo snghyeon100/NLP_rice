@@ -1,20 +1,81 @@
-model_path: ../scratch/tofu_finetuned_5epoch_aya_all_lang_5e5/
-save_dir: ../scratch/eval_finetune_aya_ar/
+model_family: qwen3_5_2b
+model_path: null
+tokenizer_path: null
+prefer_checkpoint_tokenizer: true
 
-batch_size: 24
-data_path: ./full_ar
-language: ar
-eval_task: eval_log
+compare_base: true
+base_model_path: Qwen/Qwen3.5-2B-Base
+
+languages:
+  - ar
+  - en
+  - fa
+  - fr
+  - hi
+  - id
+  - iw
+  - ja
+  - ko
+  - ru
+data_path_template: ./dataset/retain_perturbed_{language}
+data_path_by_language:
+  en: locuslab/TOFU
+data_config_by_language:
+  en: retain_perturbed
+data_loader_by_language:
+  en: hf
+output_dir: ./runs/finetune_retain_eval_all
+
 question_key: question
 answer_key: answer
+language_key: null
+unicode_normalization: NFC
+normalize_languages:
+  - hi
+match_normalization:
+  casefold: true
+  collapse_whitespace: true
+  strip_terminal_punctuation: true
+
+truth_ratio:
+  enabled: true
+  correct_answer_key: paraphrased_answer
+  perturbed_answer_key: perturbed_answer
+  mode: retain
+
+generation_eval:
+  enabled: false
+  batch_size: 4
+  max_new_tokens: 128
+  do_sample: false
+  temperature: null
+  top_p: null
+  num_beams: 1
+
+batch_size: 4
+max_length: 500
 device: cuda
-generation:
-  max_length: 200
-  max_new_tokens: null
-save_generated_text: true
-ds_size: null
-
+device_map: null
+dtype: bfloat16
+trust_remote_code: true
+low_cpu_mem_usage: true
+attn_implementation: auto
 overwrite: true
-use_pretrained: false
 
-model_family: aya-expanse-8B 
+generation:
+  enabled: true
+  batch_size: 4
+  max_new_tokens: 128
+  do_sample: false
+  temperature: null
+  top_p: null
+  num_beams: 1
+
+case_study:
+  enabled: true
+  seed: 42
+  num_best_per_language: 2
+  num_worst_per_language: 1
+  num_improved_per_language: 2
+  num_random_per_language: 1
+  max_total: null
