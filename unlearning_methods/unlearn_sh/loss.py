@@ -151,8 +151,13 @@ def compute_rcp_gradients(model, oracle_model, inputs, cfg):
         projection_applied = True
     else:
         # 충돌 없음 → forget gradient 그대로 사용
-        projected = g_f
+        projected = list(g_f)
         projection_applied = False
+
+    # ── 7. Retain 강화 (선택 사항) ──────────────────────────
+    alpha = getattr(cfg, "alpha", 0.0)
+    if alpha > 0.0:
+        projected = [p + alpha * gr for p, gr in zip(projected, g_r)]
 
     # projection_ratio: g_f와 g_r의 cosine similarity 절댓값
     projection_ratio = torch.abs(dot) / (torch.sqrt(norm_f) * torch.sqrt(norm_r) + eps)
