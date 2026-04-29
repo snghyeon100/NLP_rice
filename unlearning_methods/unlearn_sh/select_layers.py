@@ -132,21 +132,39 @@ def main():
         )
         g_f = torch.autograd.grad(forget_loss, target_params, retain_graph=False, allow_unused=True)
         
-        for g, name, p in zip(g_f, param_names, target_params):
-            if g is not None:
-                l_idx = extract_layer_idx(name)
-                if l_idx is not None:
-                    forget_scores[l_idx] = forget_scores.get(l_idx, 0.0) + (g.norm().item() ** 2) / p.numel()
-
         # 2. Retain CE gradient
         retain_loss = compute_retain_loss(model, retain_inputs)
         g_r = torch.autograd.grad(retain_loss, target_params, retain_graph=False, allow_unused=True)
+
+        # 3. RCP Projection (충돌 시 retain 방향 제거)
+        eps_proj = float(cfg.get("projection_eps", 1e-12))
+        lamb = float(cfg.get("projection_lambda", 1.0))
         
-        for g, name, p in zip(g_r, param_names, target_params):
-            if g is not None:
+        dot = sum((gf * gr).sum() for gf, gr in zip(g_f, g_r) if gf is not None and gr is not None)
+        norm_r = sum((gr * gr).sum() for gr in g_r if gr is not None) + eps_proj
+        
+        g_proj_list = []
+        if dot < 0:
+            for gf, gr in zip(g_f, g_r):
+                if gf is not None and gr is not None:
+                    g_proj_list.append(gf - lamb * (dot / norm_r) * gr)
+                else:
+                    g_proj_list.append(gf)
+        else:
+            g_proj_list = list(g_f)
+
+        # 4. 점수 누적 (forget score = ||g_proj||^2, retain score = ||g_r||^2)
+        for g_p, name, p in zip(g_proj_list, param_names, target_params):
+            if g_p is not None:
                 l_idx = extract_layer_idx(name)
                 if l_idx is not None:
-                    retain_scores[l_idx] = retain_scores.get(l_idx, 0.0) + (g.norm().item() ** 2) / p.numel()
+                    forget_scores[l_idx] = forget_scores.get(l_idx, 0.0) + (g_p.norm().item() ** 2) / p.numel()
+
+        for gr_val, name, p in zip(g_r, param_names, target_params):
+            if gr_val is not None:
+                l_idx = extract_layer_idx(name)
+                if l_idx is not None:
+                    retain_scores[l_idx] = retain_scores.get(l_idx, 0.0) + (gr_val.norm().item() ** 2) / p.numel()
 
         batch_idx += 1
         print(f"  Batch {batch_idx}/{args.num_batches} processed.")
