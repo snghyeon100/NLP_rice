@@ -1,0 +1,113 @@
+# ============================================================
+# RCP-SLoRA config
+# Retain-Conflict Projected Shared LoRA for multilingual unlearning
+# ============================================================
+
+model_family: qwen3_5_2b
+model_path: ./finetuned
+method_name: rcp_slora
+
+lr: 2e-5
+
+# --- 언어 / 데이터 설정 ---
+language: en
+split: forget01
+
+# 영어: HuggingFace Hub 문자열
+# data_path: locuslab/TOFU
+#
+# 비영어: Hydra structured config (forget/retain 경로 분리)
+# data_path:
+#   forget: ./dataset/forget01_ko
+#   retain: ./dataset/retain99_ko
+data_path: locuslab/TOFU
+
+# --- 학습 설정 ---
+batch_size: 2
+# gradient_accumulation_steps는 반드시 1이어야 합니다.
+# 1보다 크면 시작 시 ValueError가 발생합니다.
+gradient_accumulation_steps: 1
+num_epochs: 5
+beta: 1.0      # NPO beta
+gamma: 1.0     # (미사용, 호환성 유지용)
+
+# --- 수치 정밀도 ---
+# Titan XP (Pascal)는 bf16 미지원 → fp16: true 사용
+# A100/H100 등 Ampere 이상: bf16: true, fp16: false
+bf16: false
+fp16: true
+
+# --- Optimizer ---
+# paged_adamw_32bit: bitsandbytes 필요 (QLoRA 환경)
+# adamw_torch:       PyTorch 기본 AdamW, bitsandbytes 불필요 (LoRA only에 충분)
+optim: adamw_torch
+save_dir: ${model_path}/${method_name}_${lr}_${split}_${num_epochs}_${language}
+overwrite_dir: false
+weight_decay: 0.01
+save_model: true
+eval_while_train: false
+eval_only: false
+seed: 42
+
+# --- GPU 배치 ---
+gpu_train: 0   # 학습 모델 (LoRA 부착)
+gpu_oracle: 1  # oracle/reference 모델 (frozen)
+
+# --- RCP Gradient Projection ---
+projection_lambda: 1.0
+projection_eps: 1.0e-12
+
+# --- PEFT LoRA ---
+use_lora: true
+lora_r: 8
+lora_alpha: 16
+lora_dropout: 0.05
+# null이면 find_all_linear_names()로 자동 감지
+lora_target_modules: null
+# 특정 레이어에만 LoRA를 부착할 경우 리스트 지정 (예: [8, 9, 10, 11, 12, 13, 14, 15, 16, 17])
+lora_target_layers: null
+
+# LoRA adapter 저장 경로 (Stage 2 extract_lora_delta.py가 이 경로를 읽음)
+lora_save_dir: ${save_dir}/lora_adapter
+
+# ============================================================
+# 평가 설정
+# 영어 기본값. 비영어는 data_path 목록을 디스크 경로로 오버라이드.
+#
+# 비영어 예시 (ko):
+#   eval.data_path:
+#     - ./dataset/retain_perturbed_ko
+#     - ./dataset/real_authors_perturbed_ko
+#     - ./dataset/world_facts_perturbed_ko
+#     - ./dataset/forget01_perturbed_ko
+# ============================================================
+eval:
+  model_path: ${..model_path}
+  model_family: ${..model_family}
+  save_dir: ${..save_dir}
+  language: ${..language}
+
+  data_path: [locuslab/TOFU, locuslab/TOFU, locuslab/TOFU, locuslab/TOFU]
+  split: ${..split}_perturbed
+  split_list:
+    - retain_perturbed
+    - real_authors_perturbed
+    - world_facts_perturbed
+    - ${split}
+
+  eval_task: [eval_log, eval_real_author_wo_options, eval_real_world_wo_options, eval_log_forget]
+  question_key: [question, question, question, question]
+  answer_key: [answer, answer, answer, answer]
+  base_answer_key: [paraphrased_answer, answer, answer, paraphrased_answer]
+  perturbed_answer_key: [perturbed_answer, perturbed_answer, perturbed_answer, perturbed_answer]
+
+  generation:
+    max_length: 200
+    max_new_tokens: null
+
+  save_generated_text: true
+  ds_size: 300
+  overwrite: true
+  use_pretrained: false
+  batch_size: 30
+  retain_result: null

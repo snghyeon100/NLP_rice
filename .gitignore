@@ -36,3 +36,6 @@ eval_logs/
 finetuned/*
 !finetuned/
 !finetuned/.gitkeep
+
+# RCP-LoRA artifacts
+unlearning_methods/unlearn_sh/*.md
