@@ -51,11 +51,10 @@ def compute_subspace_xlingual_loss(
 
     loss = -forget_outputs.loss + alpha * retain_outputs.loss + beta * utility_outputs.loss + gamma * kl_loss
     logs = {
-        "loss": loss.detach(),
+        "objective_loss": loss.detach(),
         "forget_loss": forget_outputs.loss.detach(),
         "retain_loss": retain_outputs.loss.detach(),
         "utility_loss": utility_outputs.loss.detach(),
         "kl_loss": kl_loss.detach(),
     }
     return loss, forget_outputs, logs
-

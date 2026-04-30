@@ -48,12 +48,13 @@ def resolve_project_path(path):
 
 
 class SubspaceXlingualTrainer(Trainer):
-    def __init__(self, *args, reference_model=None, alpha=1.0, beta=1.0, gamma=1.0, **kwargs):
+    def __init__(self, *args, reference_model=None, alpha=1.0, beta=1.0, gamma=1.0, loss_log_path=None, **kwargs):
         self.reference_model = reference_model
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
         self.loss_logs = {}
+        self.loss_log_path = Path(loss_log_path) if loss_log_path is not None else None
         super().__init__(*args, **kwargs)
         if self.reference_model is not None:
             self.reference_model.eval()
@@ -75,10 +76,33 @@ class SubspaceXlingualTrainer(Trainer):
     def log(self, logs, start_time=None):
         if self.loss_logs:
             logs = {**logs, **self.loss_logs}
+        self._append_loss_log(logs)
         try:
             return super().log(logs, start_time=start_time)
         except TypeError:
             return super().log(logs)
+
+    def _append_loss_log(self, logs):
+        if self.loss_log_path is None:
+            return
+
+        self.loss_log_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "step": int(self.state.global_step),
+            "epoch": float(logs["epoch"]) if "epoch" in logs else None,
+        }
+        for key, value in logs.items():
+            if key == "epoch":
+                continue
+            if hasattr(value, "item"):
+                value = value.item()
+            if isinstance(value, (int, float, str, bool)) or value is None:
+                record[key] = value
+            else:
+                record[key] = str(value)
+
+        with open(self.loss_log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
 
 def build_training_args(cfg, max_steps, steps_per_epoch, batch_size):
@@ -116,6 +140,19 @@ def _load_model(path, model_cfg, model_id):
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         trust_remote_code=True,
     )
+
+
+def _tokenizer_source(model_path, model_id):
+    model_path = Path(model_path)
+    tokenizer_files = (
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "tokenizer.model",
+        "chat_template.jinja",
+    )
+    if model_path.exists() and any((model_path / filename).exists() for filename in tokenizer_files):
+        return str(model_path)
+    return model_id
 
 
 def _device_for_main_model():
@@ -233,7 +270,10 @@ def main(cfg):
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, Path(cfg.save_dir) / "cfg.yaml")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(
+        _tokenizer_source(cfg.model_path, model_id),
+        trust_remote_code=True,
+    )
     tokenizer.pad_token = tokenizer.eos_token
 
     dataset = SubspaceXlingualDataset(cfg, tokenizer=tokenizer, model_family=cfg.model_family)
@@ -291,6 +331,7 @@ def main(cfg):
         alpha=float(cfg.alpha),
         beta=float(cfg.beta),
         gamma=float(cfg.gamma),
+        loss_log_path=Path(cfg.save_dir) / "training_loss_history.jsonl",
     )
 
     if cfg.eval_only:
