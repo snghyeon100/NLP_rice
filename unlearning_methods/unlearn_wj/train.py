@@ -210,6 +210,13 @@ def run_eval_jobs(model, tokenizer, cfg, force=False):
         json.dump(aggregated_by_language, f, indent=4)
 
 
+def prepare_model_for_save(model, cfg):
+    if cfg.get("save_merged_model", True) and hasattr(model, "merge_and_unload"):
+        print("Merging LoRA adapter into base model before saving.")
+        return model.merge_and_unload()
+    return model
+
+
 @hydra.main(version_base=None, config_path=".", config_name="config")
 def main(cfg):
     os.chdir(PROJECT_ROOT)
@@ -295,6 +302,7 @@ def main(cfg):
         handle.remove()
 
     if cfg.save_model and (not cfg.eval_only):
+        model = prepare_model_for_save(model, cfg)
         model.save_pretrained(cfg.save_dir)
         tokenizer.save_pretrained(cfg.save_dir)
         run_eval_jobs(model, tokenizer, cfg)

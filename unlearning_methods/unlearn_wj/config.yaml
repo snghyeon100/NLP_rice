@@ -35,9 +35,10 @@ num_epochs: 5
 weight_decay: 0.01
 seed: 42
 save_model: true
+save_merged_model: true
 eval_only: false
 eval_while_train: false
-save_dir: ${model_path}/${method_name}_${lr}_${split}_${num_epochs}_${primary_target_language}
+save_dir: ./finetuned/${method_name}_${lr}_${split}_${num_epochs}_${primary_target_language}
 
 alpha: 1.0
 beta: 1.0
