@@ -1,5 +1,11 @@
 from tqdm import tqdm
-from data_module import TextDatasetQAStat, custom_data_collator, get_batch_loss, custom_data_collator_with_indices
+from data_module import (
+    TextDatasetQAStat,
+    custom_data_collator,
+    get_batch_loss,
+    custom_data_collator_with_indices,
+    normalize_eval_text,
+)
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import os, hydra
@@ -152,37 +158,46 @@ def eval_perturbation_ratio(eval_dataloader, perturb_dataloader, model):
     return eval_logs
 
 def get_dataloader(cfg, eval_task, tokenizer, folder, split, question_key, answer_key, base_answer_key, perturbed_answer_key, language):
+    max_length = cfg_get(cfg, "input_max_length", cfg.generation.max_length)
+    unicode_normalization = cfg_get(cfg, "unicode_normalization", None)
+    normalize_languages = cfg_get(cfg, "normalize_languages", None)
 
     torch_format_dataset = TextDatasetQAStat( 
         folder, 
         tokenizer=tokenizer, 
         model_family=cfg.model_family, 
-        max_length=cfg.generation.max_length, 
+        max_length=max_length,
         split=split, 
         question_key=question_key, 
         answer_key=answer_key,
-        language=language
+        language=language,
+        unicode_normalization=unicode_normalization,
+        normalize_languages=normalize_languages,
     ) 
     base_torch_format_dataset = TextDatasetQAStat(
         folder,
         tokenizer=tokenizer, 
         model_family=cfg.model_family, 
-        max_length=cfg.generation.max_length, 
+        max_length=max_length,
         split=split, 
         question_key=question_key, 
         answer_key=base_answer_key,
-        language=language
+        language=language,
+        unicode_normalization=unicode_normalization,
+        normalize_languages=normalize_languages,
     )
 
     perturb_torch_format_dataset = TextDatasetQAStat(
         folder,
         tokenizer=tokenizer, 
         model_family=cfg.model_family, 
-        max_length=cfg.generation.max_length, 
+        max_length=max_length,
         split=split, 
         question_key=question_key, 
         answer_key=perturbed_answer_key,
-        language=language
+        language=language,
+        unicode_normalization=unicode_normalization,
+        normalize_languages=normalize_languages,
     )
 
     if cfg.ds_size:
@@ -231,8 +246,24 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
         with torch.no_grad():
             outputs = model(**batch)
             input_string, gen_output, gt = run_generation(cfg, batch, model, tokenizer=tokenizer, language=language)
-            gen_outputs.extend(gen_output)
-            ground_truths.extend(gt)
+            gen_outputs.extend([
+                normalize_eval_text(
+                    text,
+                    language,
+                    cfg_get(cfg, "unicode_normalization", None),
+                    cfg_get(cfg, "normalize_languages", None),
+                )
+                for text in gen_output
+            ])
+            ground_truths.extend([
+                normalize_eval_text(
+                    text,
+                    language,
+                    cfg_get(cfg, "unicode_normalization", None),
+                    cfg_get(cfg, "normalize_languages", None),
+                )
+                for text in gt
+            ])
             input_strings.extend(input_string)
             
         gt_loss = get_batch_loss(outputs.logits, batch['labels'])
@@ -321,6 +352,9 @@ def language_eval_cfg(cfg, language):
         "base_answer_key": list_cfg(cfg_get(cfg, "base_answer_key", None)) or DEFAULT_BASE_ANSWER_KEYS,
         "perturbed_answer_key": list_cfg(cfg_get(cfg, "perturbed_answer_key", None)) or DEFAULT_PERTURBED_ANSWER_KEYS,
         "generation": OmegaConf.to_container(cfg.generation, resolve=True),
+        "input_max_length": cfg_get(cfg, "input_max_length", cfg.generation.max_length),
+        "unicode_normalization": cfg_get(cfg, "unicode_normalization", None),
+        "normalize_languages": cfg_get(cfg, "normalize_languages", None),
         "save_generated_text": cfg_get(cfg, "save_generated_text", True),
         "ds_size": cfg_get(cfg, "ds_size", None),
         "overwrite": cfg_get(cfg, "overwrite", True),
@@ -535,6 +569,7 @@ def eval_accuracy(logits, labels):
 def run_generation(cfg, batch, model, tokenizer, language='en'):
     input_ids = batch["input_ids"]
     input_strings = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
+    generation_inputs = input_strings
 
     model_cfg = get_model_identifiers_from_yaml(cfg.model_family)
     use_chat_template = str(model_cfg.get('use_chat_template', 'false')).lower() == 'true'
@@ -542,8 +577,22 @@ def run_generation(cfg, batch, model, tokenizer, language='en'):
     if use_chat_template:
         # chat template 형식: "...user\n질문\nassistant\n정답..."
         # rsplit으로 마지막 "assistant\n" 기준으로 나눔
-        ground_truth = [s.rsplit("assistant\n", 1)[-1] for s in input_strings]
-        input_strings = [s.rsplit("assistant\n", 1)[0] for s in input_strings]
+        ground_truth = []
+        display_inputs = []
+        generation_inputs = []
+        for s in input_strings:
+            prompt_text, answer_text = s.rsplit("assistant\n", 1)
+            question_text = prompt_text.rsplit("user\n", 1)[-1].strip()
+            ground_truth.append(answer_text)
+            display_inputs.append(prompt_text)
+            generation_inputs.append(
+                tokenizer.apply_chat_template(
+                    [{"role": "user", "content": question_text}],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            )
+        input_strings = display_inputs
     else:
         split_symbols = {
             "en": "Answer: ",
@@ -560,6 +609,7 @@ def run_generation(cfg, batch, model, tokenizer, language='en'):
         split_symbol = split_symbols.get(language, "Answer: ")
         ground_truth = [s.split(split_symbol)[1] for s in input_strings]
         input_strings = [s.split(split_symbol)[0] for s in input_strings]
+        generation_inputs = input_strings
 
     #now tokenize the strings with left padding
     left_pad_tokenizer = tokenizer
@@ -569,9 +619,23 @@ def run_generation(cfg, batch, model, tokenizer, language='en'):
     left_pad_tokenizer.pad_token_id = left_pad_tokenizer.eos_token_id
 
 
-    inputs = left_pad_tokenizer(input_strings, add_special_tokens=True, return_tensors='pt', padding=True).to(model.device)
+    inputs = left_pad_tokenizer(
+        generation_inputs,
+        add_special_tokens=not use_chat_template,
+        return_tensors='pt',
+        padding=True,
+    ).to(model.device)
     #now generate
-    out = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, max_length=cfg.generation.max_length, max_new_tokens=cfg.generation.max_new_tokens, do_sample=False, use_cache=True, pad_token_id=left_pad_tokenizer.eos_token_id)
+    generation_kwargs = {
+        "do_sample": False,
+        "use_cache": True,
+        "pad_token_id": left_pad_tokenizer.eos_token_id,
+    }
+    if cfg.generation.max_new_tokens is not None:
+        generation_kwargs["max_new_tokens"] = cfg.generation.max_new_tokens
+    elif cfg.generation.max_length is not None:
+        generation_kwargs["max_length"] = cfg.generation.max_length
+    out = model.generate(inputs.input_ids, attention_mask=inputs.attention_mask, **generation_kwargs)
     strs = left_pad_tokenizer.batch_decode(out[:, inputs.input_ids.shape[-1]:], skip_special_tokens=True)
     return input_strings, strs, ground_truth
 

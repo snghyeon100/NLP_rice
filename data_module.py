@@ -3,7 +3,23 @@ from torch import nn
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 import datasets
+import unicodedata
 from utils import get_model_identifiers_from_yaml, add_dataset_index
+
+
+def normalize_eval_text(text, language, unicode_normalization=None, normalize_languages=None):
+    if unicode_normalization is None or str(unicode_normalization).lower() in {"", "none", "false"}:
+        return text
+
+    if normalize_languages is not None:
+        if isinstance(normalize_languages, str):
+            normalize_languages = {normalize_languages}
+        else:
+            normalize_languages = set(normalize_languages)
+        if language not in normalize_languages:
+            return text
+
+    return unicodedata.normalize(str(unicode_normalization), text)
 
 
 def convert_raw_data_to_model_format(tokenizer, max_length, question, answer, model_configs, language='en'):
@@ -88,11 +104,13 @@ def convert_raw_data_to_model_format(tokenizer, max_length, question, answer, mo
 
 class TextDatasetQAEval(Dataset):
     def __init__(self, data_path, tokenizer, model_family, max_length=512, split=None, question_key='question',
-                 answer_key='answer', language='en'):
+                 answer_key='answer', language='en', unicode_normalization=None, normalize_languages=None):
         super(TextDatasetQAEval, self).__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.language = language
+        self.unicode_normalization = unicode_normalization
+        self.normalize_languages = normalize_languages
 
         # self.data = datasets.load_dataset(data_path, split)["train"]
         self.data = datasets.load_from_disk(data_path)['train']
@@ -106,7 +124,12 @@ class TextDatasetQAEval(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        question = self.data[idx][self.qk]
+        question = normalize_eval_text(
+            self.data[idx][self.qk],
+            self.language,
+            self.unicode_normalization,
+            self.normalize_languages,
+        )
         answers = self.data[idx][self.ak]
         indices = self.data[idx]['index']
         if isinstance(answers, str):
@@ -117,6 +140,7 @@ class TextDatasetQAEval(Dataset):
         pad_attention_mask_list = []
 
         for answer in answers:
+            answer = normalize_eval_text(answer, self.language, self.unicode_normalization, self.normalize_languages)
             converted_data = convert_raw_data_to_model_format(self.tokenizer, self.max_length, question, answer,
                                                               self.model_configs, self.language)
             pad_input_ids_list.append(converted_data[0])
@@ -131,11 +155,13 @@ class TextDatasetQAEval(Dataset):
 
 class TextDatasetQAStat(Dataset):
     def __init__(self, data_path, tokenizer, model_family, max_length=512, split=None, question_key='question',
-                 answer_key='answer', language='en'):
+                 answer_key='answer', language='en', unicode_normalization=None, normalize_languages=None):
         super(TextDatasetQAStat, self).__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.language=language
+        self.unicode_normalization = unicode_normalization
+        self.normalize_languages = normalize_languages
         if language == 'en':
             self.data = datasets.load_dataset(data_path, split)["train"]
         else:
@@ -150,7 +176,12 @@ class TextDatasetQAStat(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        question = self.data[idx][self.qk]
+        question = normalize_eval_text(
+            self.data[idx][self.qk],
+            self.language,
+            self.unicode_normalization,
+            self.normalize_languages,
+        )
         answers = self.data[idx][self.ak]
         indices = self.data[idx]['index']
         language = self.language
@@ -162,6 +193,7 @@ class TextDatasetQAStat(Dataset):
         pad_attention_mask_list = []
 
         for answer in answers:
+            answer = normalize_eval_text(answer, language, self.unicode_normalization, self.normalize_languages)
             converted_data = convert_raw_data_to_model_format(self.tokenizer, self.max_length, question, answer,
                                                               self.model_configs, language)
             pad_input_ids_list.append(converted_data[0])

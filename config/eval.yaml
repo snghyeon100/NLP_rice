@@ -14,7 +14,12 @@ save_dir: ${model_path}/eval_results/multilingual_ds_size${ds_size}
 
 generation:
   max_length: 200
-  max_new_tokens: null
+  max_new_tokens: 128
+
+input_max_length: 500
+unicode_normalization: NFC
+normalize_languages:
+  - hi
 
 save_generated_text: true
 ds_size: null
