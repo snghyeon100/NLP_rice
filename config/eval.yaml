@@ -1,0 +1,33 @@
+model_path: ./finetuned/subspace_xlingual_2e-05_forget01_5_ko
+model_family: qwen3_5_2b
+tokenizer_path: null
+prefer_checkpoint_tokenizer: true
+use_pretrained: false
+
+languages: [en, ar, fa, fr, hi, id, iw, ja, ko, ru]
+language: en
+
+split: forget01_perturbed
+english_data_path: locuslab/TOFU
+data_root: ./dataset
+save_dir: ${model_path}/eval_results/multilingual_ds_size${ds_size}
+
+generation:
+  max_length: 200
+  max_new_tokens: null
+
+save_generated_text: true
+ds_size: null
+overwrite: true
+batch_size: 4
+reinitialize_weights: false
+
+question_key: [question, question, question, question]
+answer_key: [answer, answer, answer, answer]
+base_answer_key: [paraphrased_answer, answer, answer, paraphrased_answer]
+perturbed_answer_key: [perturbed_answer, perturbed_answer, perturbed_answer, perturbed_answer]
+eval_task: [eval_log, eval_real_author_wo_options, eval_real_world_wo_options, eval_log_forget]
+
+retain_result: null
+retain_result_by_language: null
+retain_result_template: null

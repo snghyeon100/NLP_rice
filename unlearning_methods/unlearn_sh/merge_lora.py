@@ -16,7 +16,7 @@ merge된 모델은 PEFT 없이 AutoModelForCausalLM.from_pretrained()으로 로�
 평가 (merge 후):
     python evaluate_util.py \\
         model_path=./outputs/merged_ko \\
-        language=ko \\
+        'languages=[ko]' \\
         ...
 
 eval_while_train 마지막 step 대비:
@@ -97,7 +97,7 @@ def merge_lora(base_model_path: str, adapter_path: str, output_path: str, model_
     print(f"  Merged model: {output_path}")
     print(f"{'='*50}")
     print(f"\n[다음 단계 — evaluate_util.py로 평가]")
-    print(f"  python evaluate_util.py model_path={output_path} language=<lang> ...")
+    print(f"  python evaluate_util.py model_path={output_path} 'languages=[<lang>]'\n")
 
 
 def main():

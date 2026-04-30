@@ -22,7 +22,7 @@ NLP_rice/
   dataloader.py                   # fine-tuning용 Trainer 유틸
   finetune.py                     # TOFU fine-tuning 실행 스크립트
   evaluate_finetune.py            # fine-tuned/base 모델 평가 스크립트
-  evaluate_util.py                # unlearning 평가 보조 유틸
+  evaluate_util.py                # unlearning 평가 스크립트
   aggregate_eval_stat.py          # 평가 결과 집계 유틸
   utils.py                        # 모델 저장/로그 등 공통 유틸
 ```
@@ -184,8 +184,49 @@ python evaluate_finetune.py model_path=./finetuned
 
 평가 config는 `config/eval_finetune.yaml`을 기본으로 사용합니다. 전체 언어를 한 번에 평가하도록 구성되어 있으며, truth ratio와 exact match 계열 지표를 함께 확인할 수 있습니다.
 
+## Unlearning 평가
+
+Unlearning이 적용된 모델의 retain/forget 성능은 루트의 `evaluate_util.py`로 평가합니다. 평가 config는 `config/eval.yaml` 하나를 기준으로 사용하며, 기본값은 전체 언어 평가입니다.
+
+```bash
+python evaluate_util.py model_path=./finetuned/subspace_xlingual_2e-05_forget01_5_ko
+```
+
+특정 언어만 평가하려면 `languages`를 override합니다.
+
+```bash
+python evaluate_util.py \
+  model_path=./finetuned/subspace_xlingual_2e-05_forget01_5_ko \
+  'languages=[en,ko,fr]'
+```
+
+단일 언어 평가도 같은 config로 처리합니다.
+
+```bash
+python evaluate_util.py \
+  model_path=./finetuned/subspace_xlingual_2e-05_forget01_5_ko \
+  'languages=[ko]'
+```
+
+다국어 평가 결과는 기본적으로 아래 구조로 저장됩니다.
+
+```text
+{model_path}/eval_results/multilingual_ds_sizeNone/
+  en/
+    eval_log.json
+    eval_log_forget.json
+    eval_log_aggregated.json
+  ko/
+    eval_log.json
+    eval_log_forget.json
+    eval_log_aggregated.json
+  multilingual_aggregated.json
+```
+
+`Forget Quality`까지 계산하려면 99% retain 모델의 평가 결과 JSON이 필요합니다. 이때 필요한 것은 checkpoint가 아니라 retain 모델을 같은 eval pipeline으로 평가해 만든 `eval_log_aggregated.json`입니다. 경로는 `retain_result`, `retain_result_by_language`, 또는 `retain_result_template`으로 넘길 수 있습니다.
+
 ## Legacy config 주의
 
-`config/forget*.yaml` 계열 파일은 이전 구조에서 사용하던 legacy config입니다. 현재 unlearning 실행의 기준은 각 방법론 디렉토리 안의 `config.yaml`입니다.
+`config/forget*.yaml` 계열 파일은 이전 구조에서 사용하던 legacy config입니다. 현재 unlearning 실행의 기준은 각 방법론 디렉토리 안의 `config.yaml`입니다. Unlearning 평가는 언어별 `eval_<language>.yaml` 대신 `config/eval.yaml`로 통합되어 있습니다.
 
 새로운 unlearning 실험을 추가하거나 수정할 때는 `unlearning_methods/unlearn_<method_name>/config.yaml`을 먼저 수정하세요.

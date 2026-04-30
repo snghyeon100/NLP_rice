@@ -6,6 +6,7 @@ import os, hydra
 import evaluate
 import json
 from pathlib import Path
+from omegaconf import DictConfig, OmegaConf
 from rouge_score import rouge_scorer
 from utils import get_model_identifiers_from_yaml, get_model_utility, get_forget_quality
 import torch.nn as nn
@@ -15,6 +16,53 @@ import numpy as np
 from evaluate import load
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_EVAL_TASKS = [
+    "eval_log",
+    "eval_real_author_wo_options",
+    "eval_real_world_wo_options",
+    "eval_log_forget",
+]
+DEFAULT_QUESTION_KEYS = ["question", "question", "question", "question"]
+DEFAULT_ANSWER_KEYS = ["answer", "answer", "answer", "answer"]
+DEFAULT_BASE_ANSWER_KEYS = ["paraphrased_answer", "answer", "answer", "paraphrased_answer"]
+DEFAULT_PERTURBED_ANSWER_KEYS = ["perturbed_answer", "perturbed_answer", "perturbed_answer", "perturbed_answer"]
+
+
+def cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if isinstance(cfg, DictConfig):
+        return cfg.get(key, default)
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def list_cfg(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def resolve_project_path(path):
+    if path is None:
+        return None
+    path = str(path)
+    if path.startswith("/"):
+        return path
+    if path.startswith(("./", "../")):
+        return str((PROJECT_ROOT / path).resolve())
+    return path
+
+
+def infer_languages(cfg):
+    languages = list_cfg(cfg_get(cfg, "languages", None))
+    if languages:
+        return languages
+    return [cfg_get(cfg, "language", "en")]
 
 
 
@@ -146,11 +194,12 @@ def get_dataloader(cfg, eval_task, tokenizer, folder, split, question_key, answe
     eval_dataloader = torch.utils.data.DataLoader(
         torch_format_dataset, batch_size=cfg.batch_size, collate_fn=custom_data_collator_with_indices
     )
+    perturb_batch_size = max(1, cfg.batch_size // 4)
     base_eval_dataloader = torch.utils.data.DataLoader(
-        base_torch_format_dataset, batch_size=cfg.batch_size//4, collate_fn=custom_data_collator_with_indices
+        base_torch_format_dataset, batch_size=perturb_batch_size, collate_fn=custom_data_collator_with_indices
     )
     perturb_dataloader = torch.utils.data.DataLoader(
-        perturb_torch_format_dataset, batch_size=cfg.batch_size//4, collate_fn=custom_data_collator_with_indices
+        perturb_torch_format_dataset, batch_size=perturb_batch_size, collate_fn=custom_data_collator_with_indices
     )
 
     return eval_dataloader, base_eval_dataloader, perturb_dataloader
@@ -228,87 +277,246 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
 
     return eval_logs
 
-@hydra.main(version_base=None, config_path="config", config_name="eval_everything")
-def main(cfg):
-    assert len(cfg.data_path)==len(cfg.split_list)==len(cfg.eval_task)==len(cfg.question_key)==len(cfg.answer_key)==len(cfg.base_answer_key)==len(cfg.perturbed_answer_key), "data_path, split, eval_task, question_key, and answer_key must be the same length"
-    Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
 
-    if os.environ.get('LOCAL_RANK') is not None:
-        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
-        device_map = {'': local_rank}
+def language_data_path(cfg, language):
+    data_path_by_language = cfg_get(cfg, "data_path_by_language", None)
+    if data_path_by_language is not None and language in data_path_by_language:
+        data_path = data_path_by_language[language]
+        if isinstance(data_path, str):
+            return [data_path] * 4
+        return list(data_path)
 
-    os.environ["WANDB_DISABLED"] = "true"
-    model_cfg = get_model_identifiers_from_yaml(cfg.model_family)
-    model_id = model_cfg["hf_key"]
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if cfg_get(cfg, "data_path", None) is not None and cfg_get(cfg, "languages", None) is None:
+        return list(cfg.data_path)
 
-    tokenizer.pad_token = tokenizer.eos_token
-    max_length = 500
-    batch_size = cfg.batch_size
+    if language == "en":
+        return [cfg_get(cfg, "english_data_path", "locuslab/TOFU")] * 4
 
-    model = None
+    data_root = cfg_get(cfg, "data_root", "./dataset")
+    split = cfg_get(cfg, "split", "forget01_perturbed")
+    return [
+        f"{data_root}/retain_perturbed_{language}",
+        f"{data_root}/real_authors_perturbed_{language}",
+        f"{data_root}/world_facts_perturbed_{language}",
+        f"{data_root}/{split}_{language}",
+    ]
+
+
+def language_eval_cfg(cfg, language):
+    split = cfg_get(cfg, "split", "forget01_perturbed")
+    language_cfg = {
+        "model_family": cfg.model_family,
+        "language": language,
+        "data_path": language_data_path(cfg, language),
+        "split": split,
+        "split_list": list_cfg(cfg_get(cfg, "split_list", None)) or [
+            "retain_perturbed",
+            "real_authors_perturbed",
+            "world_facts_perturbed",
+            split,
+        ],
+        "eval_task": list_cfg(cfg_get(cfg, "eval_task", None)) or DEFAULT_EVAL_TASKS,
+        "question_key": list_cfg(cfg_get(cfg, "question_key", None)) or DEFAULT_QUESTION_KEYS,
+        "answer_key": list_cfg(cfg_get(cfg, "answer_key", None)) or DEFAULT_ANSWER_KEYS,
+        "base_answer_key": list_cfg(cfg_get(cfg, "base_answer_key", None)) or DEFAULT_BASE_ANSWER_KEYS,
+        "perturbed_answer_key": list_cfg(cfg_get(cfg, "perturbed_answer_key", None)) or DEFAULT_PERTURBED_ANSWER_KEYS,
+        "generation": OmegaConf.to_container(cfg.generation, resolve=True),
+        "save_generated_text": cfg_get(cfg, "save_generated_text", True),
+        "ds_size": cfg_get(cfg, "ds_size", None),
+        "overwrite": cfg_get(cfg, "overwrite", True),
+        "use_pretrained": cfg_get(cfg, "use_pretrained", False),
+        "batch_size": int(cfg_get(cfg, "batch_size", 4)),
+        "retain_result": retain_result_for_language(cfg, language),
+    }
+    return OmegaConf.create(language_cfg)
+
+
+def retain_result_for_language(cfg, language):
+    retain_result_by_language = cfg_get(cfg, "retain_result_by_language", None)
+    if retain_result_by_language is not None and language in retain_result_by_language:
+        return retain_result_by_language[language]
+
+    retain_result_template = cfg_get(cfg, "retain_result_template", None)
+    if retain_result_template:
+        return str(retain_result_template).format(language=language)
+
+    return cfg_get(cfg, "retain_result", None)
+
+
+def evaluate_one_language(model, tokenizer, cfg, language, save_dir):
+    eval_cfg = language_eval_cfg(cfg, language)
+    assert len(eval_cfg.data_path) == len(eval_cfg.split_list) == len(eval_cfg.eval_task) == len(eval_cfg.question_key) == len(eval_cfg.answer_key) == len(eval_cfg.base_answer_key) == len(eval_cfg.perturbed_answer_key), "data_path, split, eval_task, and answer key lists must have the same length"
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+    aggregated_eval_logs = {}
+    for folder, split, question_key, answer_key, eval_task, base_answer_key, perturbed_answer_key in zip(
+        eval_cfg.data_path,
+        eval_cfg.split_list,
+        eval_cfg.question_key,
+        eval_cfg.answer_key,
+        eval_cfg.eval_task,
+        eval_cfg.base_answer_key,
+        eval_cfg.perturbed_answer_key,
+    ):
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if eval_task == "eval_log_forget":
+            split = eval_cfg.split
+        print(f"[{language}] Working on eval task {eval_task} with split {split}")
+        save_filename = os.path.join(save_dir, f"{eval_task}.json")
+        save_filename = save_filename if world_size == 1 else os.path.join(save_dir, f"{eval_task}_{os.environ.get('LOCAL_RANK', '0')}.json")
+
+        if os.path.exists(save_filename) and not eval_cfg.overwrite:
+            print(f"Skipping {eval_task} because {save_filename} already exists")
+            with open(save_filename, "r") as f:
+                aggregated_eval_logs[f"{eval_task}.json"] = json.load(f)
+            continue
+
+        eval_dataloader, base_eval_dataloader, perturb_dataloader = get_dataloader(
+            eval_cfg,
+            eval_task,
+            tokenizer,
+            resolve_project_path(folder),
+            split,
+            question_key,
+            answer_key,
+            base_answer_key,
+            perturbed_answer_key,
+            language=language,
+        )
+
+        normalize_gt = "eval_log" not in eval_task
+        eval_logs = get_all_evals(
+            eval_cfg,
+            model,
+            tokenizer,
+            eval_task,
+            eval_dataloader,
+            base_eval_dataloader,
+            perturb_dataloader,
+            normalize_gt=normalize_gt,
+            language=language,
+        )
+
+        with open(save_filename, "w") as f:
+            json.dump(eval_logs, f, indent=4)
+
+        aggregated_eval_logs[f"{eval_task}.json"] = eval_logs
+
+    aggregated_eval_log_filename = os.path.join(save_dir, "eval_log_aggregated.json")
+    with open(aggregated_eval_log_filename, "w") as f:
+        json.dump(aggregated_eval_logs, f, indent=4)
+
+    if eval_cfg.retain_result is not None:
+        retain_result = json.load(open(resolve_project_path(eval_cfg.retain_result), "r"))
+        aggregate_stat = {**get_model_utility(aggregated_eval_logs), **get_forget_quality(aggregated_eval_logs, retain_result)}
+        with open(os.path.join(save_dir, "aggregate_stat.csv"), "w") as f:
+            writer = csv.DictWriter(f, fieldnames=list(aggregate_stat.keys()))
+            writer.writeheader()
+            writer.writerow(aggregate_stat)
+
+    return aggregated_eval_logs
+
+
+def evaluate_languages(model, tokenizer, cfg):
+    languages = infer_languages(cfg)
+    multilingual = cfg_get(cfg, "languages", None) is not None
+    all_logs = {}
+
+    for language in languages:
+        save_dir = Path(resolve_project_path(cfg.save_dir))
+        if multilingual:
+            save_dir = save_dir / language
+        all_logs[language] = evaluate_one_language(model, tokenizer, cfg, language, save_dir)
+
+    if multilingual:
+        root_save_dir = Path(resolve_project_path(cfg.save_dir))
+        root_save_dir.mkdir(parents=True, exist_ok=True)
+        with open(root_save_dir / "multilingual_aggregated.json", "w") as f:
+            json.dump(all_logs, f, indent=4)
+
+    return all_logs
+
+
+def load_eval_model(cfg, model_cfg, model_id):
+    device_map = None
+    if os.environ.get("LOCAL_RANK") is not None:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        device_map = {"": local_rank}
+
     config = AutoConfig.from_pretrained(model_id)
+    model = None
     for attempt in range(3):
         try:
-        # do thing
             if cfg.use_pretrained:
                 print(f"Loading pretrained from {model_id}")
-                model = AutoModelForCausalLM.from_pretrained(model_id, config=config, attn_implementation="flash_attention_2" if model_cfg["flash_attention2"] == "true" else None, torch_dtype=torch.bfloat16, trust_remote_code = True, device_map=device_map)
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    config=config,
+                    attn_implementation="flash_attention_2" if model_cfg["flash_attention2"] == "true" else None,
+                    torch_dtype=torch.bfloat16,
+                    trust_remote_code=True,
+                    device_map=device_map,
+                )
             else:
                 print(f"Loading checkpoint from {cfg.model_path}")
-                model = AutoModelForCausalLM.from_pretrained(cfg.model_path, config=config, attn_implementation="flash_attention_2" if model_cfg["flash_attention2"] == "true" else None, torch_dtype=torch.bfloat16, trust_remote_code = True)
+                model = AutoModelForCausalLM.from_pretrained(
+                    resolve_project_path(cfg.model_path),
+                    config=config,
+                    attn_implementation="flash_attention_2" if model_cfg["flash_attention2"] == "true" else None,
+                    torch_dtype=torch.bfloat16,
+                    trust_remote_code=True,
+                    device_map=device_map,
+                )
         except Exception as e:
             print(e)
             continue
-        # perhaps reconnect, etc.
         else:
             break
     else:
-        print("Error: could not load model")
+        raise RuntimeError("Could not load model.")
+
     model = model.eval()
-    model.to("cuda")
-    def reinitialize_weights(model) -> None:
-        for module in model.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0, std=0.02)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
+    if device_map is None:
+        model.to("cuda")
+    return model
+
+
+def load_eval_tokenizer(cfg, model_id):
+    tokenizer_path = cfg_get(cfg, "tokenizer_path", None)
+    if tokenizer_path is not None:
+        source = resolve_project_path(tokenizer_path)
+    elif cfg_get(cfg, "prefer_checkpoint_tokenizer", False) and not cfg_get(cfg, "use_pretrained", False):
+        model_path = resolve_project_path(cfg.model_path)
+        source = model_path if Path(model_path, "tokenizer_config.json").exists() else model_id
+    else:
+        source = model_id
+    tokenizer = AutoTokenizer.from_pretrained(source)
+    tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
+
+
+def reinitialize_weights(model) -> None:
+    for module in model.modules():
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+
+
+@hydra.main(version_base=None, config_path="config", config_name="eval")
+def main(cfg):
+    os.chdir(PROJECT_ROOT)
+    os.environ["WANDB_DISABLED"] = "true"
+    model_cfg = get_model_identifiers_from_yaml(cfg.model_family)
+    model_id = model_cfg["hf_key"]
+    tokenizer = load_eval_tokenizer(cfg, model_id)
+    model = load_eval_model(cfg, model_cfg, model_id)
 
     if cfg.reinitialize_weights:
         print("Reinitializing weights")
         reinitialize_weights(model)
 
-    #write custom eval loop using compute_metrics
-
-    aggregated_eval_logs = {}
-    for i, (folder, split, question_key, answer_key, eval_task, base_answer_key, perturbed_answer_key) in enumerate(zip(cfg.data_path, cfg.split_list, cfg.question_key, cfg.answer_key, cfg.eval_task, cfg.base_answer_key, cfg.perturbed_answer_key)):
-        world_size = int(os.environ.get('WORLD_SIZE', '1'))
-        print(f'Working on eval task {eval_task} with split {split}')
-        save_filename = os.path.join(cfg.save_dir, f"{eval_task}.json")
-        save_filename = save_filename if world_size == 1 else os.path.join(cfg.save_dir, f"{eval_task}_{os.environ.get('LOCAL_RANK', '0')}.json")
-
-        if os.path.exists(save_filename) and not cfg.overwrite:
-            print(f"Skipping {eval_task} because {save_filename} already exists")
-            continue
-
-        eval_dataloader, base_eval_dataloader, perturb_dataloader = get_dataloader(cfg, eval_task, tokenizer, folder, split, question_key, answer_key, base_answer_key, perturbed_answer_key, language=cfg.language)
-
-        normalize_gt = False 
-        if 'eval_log' not in eval_task:
-            normalize_gt = True
-        eval_logs = get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_dataloader, perturb_dataloader, normalize_gt=normalize_gt, language=cfg.language)
-
-        with open(save_filename, "w") as f:
-            # pretty write json to f
-            json.dump(eval_logs, f, indent=4)
-
-        aggregated_eval_logs[f'{eval_task}.json'] = eval_logs
-
-    aggregated_eval_log_filename = os.path.join(cfg.save_dir, "eval_log_aggregated.json")
-
-    with open(aggregated_eval_log_filename, "w") as f:
-        # pretty write json to f
-        json.dump(aggregated_eval_logs, f, indent=4)
+    evaluate_languages(model, tokenizer, cfg)
                     
 
 def eval_accuracy(logits, labels):
@@ -400,4 +608,3 @@ def eval_rouge_recall(gen_outputs, ground_truths, indices):
 if __name__ == "__main__":
     torch.set_default_dtype(torch.float32)
     main()
-
