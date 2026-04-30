@@ -284,7 +284,6 @@ def main(cfg):
         alpha=float(cfg.alpha),
         beta=float(cfg.beta),
         gamma=float(cfg.gamma),
-        tokenizer=tokenizer,
     )
 
     if cfg.eval_only:
