@@ -33,6 +33,25 @@ DEFAULT_QUESTION_KEYS = ["question", "question", "question", "question"]
 DEFAULT_ANSWER_KEYS = ["answer", "answer", "answer", "answer"]
 DEFAULT_BASE_ANSWER_KEYS = ["paraphrased_answer", "answer", "answer", "paraphrased_answer"]
 DEFAULT_PERTURBED_ANSWER_KEYS = ["perturbed_answer", "perturbed_answer", "perturbed_answer", "perturbed_answer"]
+SUMMARY_COLUMNS = [
+    "language",
+    "Prob. Real Authors",
+    "Truth Ratio Real Authors",
+    "Prob. Real World",
+    "Truth Ratio Real World",
+    "Prob. Retain",
+    "Truth Ratio Retain",
+    "Prob. Forget",
+    "Truth Ratio Forget",
+    "Model Utility",
+    "Forget Quality",
+]
+SUMMARY_TASKS = {
+    "eval_real_author_wo_options.json": "Real Authors",
+    "eval_real_world_wo_options.json": "Real World",
+    "eval_log.json": "Retain",
+    "eval_log_forget.json": "Forget",
+}
 
 
 def cfg_get(cfg, key, default=None):
@@ -377,6 +396,167 @@ def retain_result_for_language(cfg, language):
     return cfg_get(cfg, "retain_result", None)
 
 
+def _json_float(value):
+    if value is None:
+        return None
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, (int, float)):
+        value = float(value)
+        if np.isfinite(value):
+            return value
+    return None
+
+
+def _exp_neg(value):
+    return np.exp(-1 * np.array(value, dtype=np.float64))
+
+
+def _common_keys(first, second):
+    return [key for key in first.keys() if key in second]
+
+
+def _summary_probability(eval_logs, task_name):
+    task_logs = eval_logs.get(task_name)
+    if task_logs is None or "avg_gt_loss" not in task_logs:
+        return None
+
+    avg_gt_loss = task_logs["avg_gt_loss"]
+    if "eval_log" in task_name:
+        probs = _exp_neg(list(avg_gt_loss.values()))
+        return _json_float(np.mean(probs))
+
+    avg_perturb_loss = task_logs.get("average_perturb_loss")
+    if avg_perturb_loss is None:
+        return None
+
+    keys = _common_keys(avg_gt_loss, avg_perturb_loss)
+    if not keys:
+        return None
+
+    true_probs = _exp_neg([avg_gt_loss[key] for key in keys])
+    perturb_prob_sums = np.array([
+        np.sum(_exp_neg(avg_perturb_loss[key]))
+        for key in keys
+    ], dtype=np.float64)
+    all_probs = true_probs + perturb_prob_sums
+    normalized_true_probs = np.divide(
+        true_probs,
+        all_probs,
+        out=np.zeros_like(true_probs, dtype=np.float64),
+        where=all_probs != 0,
+    )
+    return _json_float(np.mean(normalized_true_probs))
+
+
+def _summary_truth_ratio(eval_logs, task_name):
+    task_logs = eval_logs.get(task_name)
+    if task_logs is None:
+        return None
+
+    avg_paraphrased_loss = task_logs.get("avg_paraphrased_loss")
+    avg_perturb_loss = task_logs.get("average_perturb_loss")
+    if avg_paraphrased_loss is None or avg_perturb_loss is None:
+        return None
+
+    keys = _common_keys(avg_paraphrased_loss, avg_perturb_loss)
+    if not keys:
+        return None
+
+    paraphrase_losses = np.array([avg_paraphrased_loss[key] for key in keys], dtype=np.float64)
+    perturb_losses = np.array([
+        np.mean(np.array(avg_perturb_loss[key], dtype=np.float64))
+        for key in keys
+    ], dtype=np.float64)
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        curr_stat = np.exp(np.clip(perturb_losses - paraphrase_losses, -745, 700))
+        inverse_stat = np.divide(
+            1.0,
+            curr_stat,
+            out=np.full_like(curr_stat, np.inf, dtype=np.float64),
+            where=curr_stat != 0,
+        )
+        if "forget" in task_name:
+            truth_ratio = np.mean(np.minimum(curr_stat, inverse_stat))
+        else:
+            truth_ratio = np.mean(np.maximum(0, 1 - inverse_stat))
+    return _json_float(truth_ratio)
+
+
+def _harmonic_mean(values):
+    valid = [float(value) for value in values if value is not None and np.isfinite(value)]
+    if not valid:
+        return None
+    if any(value == 0 for value in valid):
+        return 0.0
+    return _json_float(len(valid) / sum(1 / value for value in valid))
+
+
+def _load_retain_result(path):
+    if path is None:
+        return None
+    with open(resolve_project_path(path), "r") as f:
+        return json.load(f)
+
+
+def build_summary_row(language, eval_logs, retain_result=None):
+    row = {"language": language}
+    for task_name, task_label in SUMMARY_TASKS.items():
+        row[f"Prob. {task_label}"] = _summary_probability(eval_logs, task_name)
+        row[f"Truth Ratio {task_label}"] = _summary_truth_ratio(eval_logs, task_name)
+
+    utility_values = [
+        row["Prob. Real Authors"],
+        row["Truth Ratio Real Authors"],
+        row["Prob. Real World"],
+        row["Truth Ratio Real World"],
+        row["Prob. Retain"],
+        row["Truth Ratio Retain"],
+    ]
+    row["Model Utility"] = _harmonic_mean(utility_values)
+
+    row["Forget Quality"] = None
+    if retain_result is not None:
+        row["Forget Quality"] = _json_float(get_forget_quality(eval_logs, retain_result)["Forget Quality"])
+
+    return {column: row.get(column) for column in SUMMARY_COLUMNS}
+
+
+def combine_language_logs(logs_by_language):
+    combined = {}
+    for language, language_logs in logs_by_language.items():
+        for task_name, task_logs in language_logs.items():
+            combined_task = combined.setdefault(task_name, {})
+            for metric_name, metric_values in task_logs.items():
+                if not isinstance(metric_values, dict):
+                    continue
+                combined_metric = combined_task.setdefault(metric_name, {})
+                for sample_idx, value in metric_values.items():
+                    combined_metric[f"{language}:{sample_idx}"] = value
+    return combined
+
+
+def write_summary_files(root_save_dir, rows):
+    root_save_dir = Path(root_save_dir)
+    root_save_dir.mkdir(parents=True, exist_ok=True)
+
+    json_rows = [
+        {key: _json_float(value) if key != "language" else value for key, value in row.items()}
+        for row in rows
+    ]
+    with open(root_save_dir / "eval_summary.json", "w") as f:
+        json.dump(json_rows, f, indent=4)
+
+    with open(root_save_dir / "eval_summary.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS)
+        writer.writeheader()
+        for row in json_rows:
+            writer.writerow({
+                key: "" if value is None else value
+                for key, value in row.items()
+            })
+
+
 def evaluate_one_language(model, tokenizer, cfg, language, save_dir):
     eval_cfg = language_eval_cfg(cfg, language)
     assert len(eval_cfg.data_path) == len(eval_cfg.split_list) == len(eval_cfg.eval_task) == len(eval_cfg.question_key) == len(eval_cfg.answer_key) == len(eval_cfg.base_answer_key) == len(eval_cfg.perturbed_answer_key), "data_path, split, eval_task, and answer key lists must have the same length"
@@ -455,18 +635,34 @@ def evaluate_languages(model, tokenizer, cfg):
     languages = infer_languages(cfg)
     multilingual = cfg_get(cfg, "languages", None) is not None
     all_logs = {}
+    summary_rows = []
+    retain_logs_by_language = {}
+    root_save_dir = Path(resolve_project_path(cfg.save_dir))
 
     for language in languages:
-        save_dir = Path(resolve_project_path(cfg.save_dir))
+        save_dir = root_save_dir
         if multilingual:
             save_dir = save_dir / language
         all_logs[language] = evaluate_one_language(model, tokenizer, cfg, language, save_dir)
 
+        retain_result_path = retain_result_for_language(cfg, language)
+        retain_result = _load_retain_result(retain_result_path) if retain_result_path is not None else None
+        if retain_result is not None:
+            retain_logs_by_language[language] = retain_result
+        summary_rows.append(build_summary_row(language, all_logs[language], retain_result))
+
     if multilingual:
-        root_save_dir = Path(resolve_project_path(cfg.save_dir))
         root_save_dir.mkdir(parents=True, exist_ok=True)
         with open(root_save_dir / "multilingual_aggregated.json", "w") as f:
             json.dump(all_logs, f, indent=4)
+
+    if len(languages) > 1:
+        combined_retain_result = None
+        if len(retain_logs_by_language) == len(languages):
+            combined_retain_result = combine_language_logs(retain_logs_by_language)
+        summary_rows.append(build_summary_row("total", combine_language_logs(all_logs), combined_retain_result))
+
+    write_summary_files(root_save_dir, summary_rows)
 
     return all_logs
 
