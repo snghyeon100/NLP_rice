@@ -1,0 +1,123 @@
+model_family: qwen3_5_2b
+model_path: ./finetuned/epoch5
+reference_model_path: ${model_path}
+method_name: rep_erasure_xlingual
+
+language: en
+target_languages: [ko]
+primary_target_language: ko
+split: forget01
+retain_split: retain99
+
+forget_data_path: locuslab/TOFU
+forget_split: ${split}
+forget_probe_data_path: locuslab/TOFU
+forget_probe_split: ${split}_perturbed
+retain_data_path: locuslab/TOFU
+retain_split_name: ${retain_split}
+utility_data_path: ./dataset/full_merged_all_10_lang
+
+parallel_utility_data_path:
+  en:
+    path: locuslab/TOFU
+    split: ${retain_split}
+    language: en
+  tgt:
+    path: ./dataset/retain99_${primary_target_language}
+    language: ${primary_target_language}
+
+question_key: question
+answer_key: answer
+paraphrased_answer_key: paraphrased_answer
+perturbed_answer_key: perturbed_answer
+max_length: 500
+answer_max_length: 128
+decontaminate_utility: true
+
+probe:
+  train: true
+  load_path: null
+  save_path: null
+  candidate_layers: auto
+  hidden_rank: 64
+  pooling: last
+  temperature: 0.07
+  num_epochs: 20
+  lr: 1e-3
+  weight_decay: 0.01
+  max_batches: null
+  max_positive_targets: 2
+  use_paraphrase_positive: true
+  use_perturbed_negatives: false
+  max_negative_targets: 0
+  log_every: 10
+
+localization:
+  run: true
+  selected_layers_path: null
+  num_batches: 8
+  select_top_k_layers: 8
+  select_score_threshold: null
+  decodability_weight: 1.0
+  share_weight: 1.0
+  utility_weight: 1.0
+  share_score_type: hidden
+  pooling: mean
+  score_eps: 1e-12
+
+erase:
+  lr: 3e-5
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  num_epochs: 5
+  weight_decay: 0.01
+  erase_weight: 1.0
+  retain_ce_weight: 0.5
+  utility_ce_weight: 0.5
+  retain_kl_weight: 0.1
+  utility_kl_weight: 0.1
+  hidden_preserve_weight: 0.1
+  forget_hidden_norm_weight: 0.01
+  logging_steps: 10
+  save_steps: null
+
+use_lora: true
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+full_finetune: false
+
+seed: 42
+save_model: true
+save_merged_model: true
+eval_only: false
+save_dir: ./finetuned/${method_name}_${erase.lr}_${split}_${erase.num_epochs}_${primary_target_language}
+run_eval_after_train: false
+
+eval_after_train:
+  languages: [en, ar, fa, fr, hi, id, iw, ja, ko, ru]
+  language: en
+  split: ${split}_perturbed
+  english_data_path: ${forget_data_path}
+  data_root: ./dataset
+  save_dir: ${save_dir}/eval_results/multilingual
+  generation:
+    max_length: 200
+    max_new_tokens: 128
+  input_max_length: ${max_length}
+  unicode_normalization: NFC
+  normalize_languages:
+    - hi
+  save_generated_text: true
+  ds_size: null
+  overwrite: true
+  batch_size: 4
+  question_key: [question, question, question, question]
+  answer_key: [answer, answer, answer, answer]
+  base_answer_key: [paraphrased_answer, answer, answer, paraphrased_answer]
+  perturbed_answer_key: [perturbed_answer, perturbed_answer, perturbed_answer, perturbed_answer]
+  eval_task: [eval_log, eval_real_author_wo_options, eval_real_world_wo_options, eval_log_forget]
+  retain_result: null
+  retain_result_by_language: null
+  retain_result_template: null
