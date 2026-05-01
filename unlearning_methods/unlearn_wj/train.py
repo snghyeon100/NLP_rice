@@ -22,7 +22,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, set_seed
 
-from evaluate_util import get_all_evals, get_dataloader
+from evaluate_util import evaluate_languages, get_all_evals, get_dataloader
 from unlearning_methods.unlearn_wj.dataloader import SubspaceXlingualDataset, subspace_xlingual_collator
 from unlearning_methods.unlearn_wj.localization import load_selected_layers, run_localization
 from unlearning_methods.unlearn_wj.loss import compute_subspace_xlingual_loss
@@ -54,6 +54,8 @@ class SubspaceXlingualTrainer(Trainer):
         self.beta = beta
         self.gamma = gamma
         self.loss_logs = {}
+        self.loss_log_sums = {}
+        self.loss_log_count = 0
         self.loss_log_path = Path(loss_log_path) if loss_log_path is not None else None
         super().__init__(*args, **kwargs)
         if self.reference_model is not None:
@@ -71,12 +73,21 @@ class SubspaceXlingualTrainer(Trainer):
             gamma=self.gamma,
         )
         self.loss_logs = {key: float(value.cpu()) for key, value in logs.items()}
+        for key, value in self.loss_logs.items():
+            self.loss_log_sums[key] = self.loss_log_sums.get(key, 0.0) + value
+        self.loss_log_count += 1
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs, start_time=None):
-        if self.loss_logs:
-            logs = {**logs, **self.loss_logs}
+        if self.loss_log_count:
+            averaged_loss_logs = {
+                key: value / self.loss_log_count
+                for key, value in self.loss_log_sums.items()
+            }
+            logs = {**logs, **averaged_loss_logs}
         self._append_loss_log(logs)
+        self.loss_log_sums = {}
+        self.loss_log_count = 0
         try:
             return super().log(logs, start_time=start_time)
         except TypeError:
@@ -247,6 +258,74 @@ def run_eval_jobs(model, tokenizer, cfg, force=False):
         json.dump(aggregated_by_language, f, indent=4)
 
 
+def run_multilingual_eval(model, tokenizer, cfg, force=False):
+    if not force and not cfg.get("run_eval_after_train", False):
+        return
+
+    eval_cfg = cfg.get("eval_after_train", None)
+    eval_cfg = OmegaConf.create(OmegaConf.to_container(eval_cfg, resolve=True) if eval_cfg is not None else {})
+
+    eval_cfg.model_family = cfg.model_family
+    eval_cfg.model_path = cfg.save_dir
+    eval_cfg.tokenizer_path = cfg.save_dir
+    eval_cfg.prefer_checkpoint_tokenizer = True
+    eval_cfg.use_pretrained = False
+    eval_cfg.reinitialize_weights = False
+
+    if "languages" not in eval_cfg:
+        eval_cfg.languages = ["en", "ar", "fa", "fr", "hi", "id", "iw", "ja", "ko", "ru"]
+    if "language" not in eval_cfg:
+        eval_cfg.language = "en"
+    if "split" not in eval_cfg:
+        eval_cfg.split = f"{cfg.split}_perturbed"
+    if "english_data_path" not in eval_cfg:
+        eval_cfg.english_data_path = cfg.get("forget_data_path", "locuslab/TOFU")
+    if "data_root" not in eval_cfg:
+        eval_cfg.data_root = "./dataset"
+    if "save_dir" not in eval_cfg:
+        eval_cfg.save_dir = str(Path(cfg.save_dir) / "eval_results" / "multilingual")
+    if "generation" not in eval_cfg:
+        eval_cfg.generation = {"max_length": 200, "max_new_tokens": 128}
+    else:
+        if "max_length" not in eval_cfg.generation:
+            eval_cfg.generation.max_length = 200
+        if "max_new_tokens" not in eval_cfg.generation:
+            eval_cfg.generation.max_new_tokens = 128
+    if "input_max_length" not in eval_cfg:
+        eval_cfg.input_max_length = cfg.get("max_length", 500)
+    if "unicode_normalization" not in eval_cfg:
+        eval_cfg.unicode_normalization = "NFC"
+    if "normalize_languages" not in eval_cfg:
+        eval_cfg.normalize_languages = ["hi"]
+    if "save_generated_text" not in eval_cfg:
+        eval_cfg.save_generated_text = True
+    if "ds_size" not in eval_cfg:
+        eval_cfg.ds_size = None
+    if "overwrite" not in eval_cfg:
+        eval_cfg.overwrite = True
+    if "batch_size" not in eval_cfg:
+        eval_cfg.batch_size = 4
+    if "question_key" not in eval_cfg:
+        eval_cfg.question_key = ["question", "question", "question", "question"]
+    if "answer_key" not in eval_cfg:
+        eval_cfg.answer_key = ["answer", "answer", "answer", "answer"]
+    if "base_answer_key" not in eval_cfg:
+        eval_cfg.base_answer_key = ["paraphrased_answer", "answer", "answer", "paraphrased_answer"]
+    if "perturbed_answer_key" not in eval_cfg:
+        eval_cfg.perturbed_answer_key = ["perturbed_answer", "perturbed_answer", "perturbed_answer", "perturbed_answer"]
+    if "eval_task" not in eval_cfg:
+        eval_cfg.eval_task = ["eval_log", "eval_real_author_wo_options", "eval_real_world_wo_options", "eval_log_forget"]
+    if "retain_result" not in eval_cfg:
+        eval_cfg.retain_result = None
+    if "retain_result_by_language" not in eval_cfg:
+        eval_cfg.retain_result_by_language = None
+    if "retain_result_template" not in eval_cfg:
+        eval_cfg.retain_result_template = None
+
+    print(f"Running multilingual evaluation after training. Results will be saved to {eval_cfg.save_dir}")
+    evaluate_languages(model, tokenizer, eval_cfg)
+
+
 def prepare_model_for_save(model, cfg):
     if cfg.get("save_merged_model", True) and hasattr(model, "merge_and_unload"):
         print("Merging LoRA adapter into base model before saving.")
@@ -270,8 +349,10 @@ def main(cfg):
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, Path(cfg.save_dir) / "cfg.yaml")
 
+    tokenizer_source = _tokenizer_source(cfg.model_path, model_id)
+    print(f"Loading tokenizer from {tokenizer_source}")
     tokenizer = AutoTokenizer.from_pretrained(
-        _tokenizer_source(cfg.model_path, model_id),
+        tokenizer_source,
         trust_remote_code=True,
     )
     tokenizer.pad_token = tokenizer.eos_token
@@ -346,7 +427,7 @@ def main(cfg):
         model = prepare_model_for_save(model, cfg)
         model.save_pretrained(cfg.save_dir)
         tokenizer.save_pretrained(cfg.save_dir)
-        run_eval_jobs(model, tokenizer, cfg)
+        run_multilingual_eval(model, tokenizer, cfg)
 
     for file in Path(cfg.save_dir).glob("checkpoint-*"):
         for global_step_dir in file.glob("global_step*"):

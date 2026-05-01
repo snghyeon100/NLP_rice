@@ -72,6 +72,33 @@ logging_steps: 10
 save_steps: null
 run_eval_after_train: false
 
+eval_after_train:
+  languages: [en, ar, fa, fr, hi, id, iw, ja, ko, ru]
+  language: en
+  split: ${split}_perturbed
+  english_data_path: ${forget_data_path}
+  data_root: ./dataset
+  save_dir: ${save_dir}/eval_results/multilingual
+  generation:
+    max_length: 200
+    max_new_tokens: 128
+  input_max_length: ${max_length}
+  unicode_normalization: NFC
+  normalize_languages:
+    - hi
+  save_generated_text: true
+  ds_size: null
+  overwrite: true
+  batch_size: 4
+  question_key: [question, question, question, question]
+  answer_key: [answer, answer, answer, answer]
+  base_answer_key: [paraphrased_answer, answer, answer, paraphrased_answer]
+  perturbed_answer_key: [perturbed_answer, perturbed_answer, perturbed_answer, perturbed_answer]
+  eval_task: [eval_log, eval_real_author_wo_options, eval_real_world_wo_options, eval_log_forget]
+  retain_result: null
+  retain_result_by_language: null
+  retain_result_template: null
+
 eval:
   jobs:
     - language: en
