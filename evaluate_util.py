@@ -931,7 +931,7 @@ def write_summary_files(root_save_dir, rows):
         {key: row.get(key) for key in SUMMARY_TSV_COLUMNS}
         for row in json_rows
     ]
-    with open(root_save_dir / "eval_summary.tsv", "w", newline="") as f:
+    with open(root_save_dir / "eval_summary.txt", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=SUMMARY_TSV_COLUMNS, delimiter="\t")
         writer.writeheader()
         for row in tsv_rows:
