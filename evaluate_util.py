@@ -33,16 +33,19 @@ DEFAULT_BASE_ANSWER_KEYS = ["paraphrased_answer", "answer", "answer", "paraphras
 DEFAULT_PERTURBED_ANSWER_KEYS = ["perturbed_answer", "perturbed_answer", "perturbed_answer", "perturbed_answer"]
 SUMMARY_COLUMNS = [
     "language",
-    "Prob. Real Authors",
-    "Truth Ratio Real Authors",
-    "Prob. Real World",
-    "Truth Ratio Real World",
-    "Prob. Retain",
-    "Truth Ratio Retain",
-    "Prob. Forget",
-    "Truth Ratio Forget",
     "Model Utility",
-    "Forget Quality",
+    "MU",
+    "Prob. Retain",
+    "PR",
+    "Prob. Forget",
+    "PF",
+    "Truth Ratio Forget",
+    "TRF",
+    "Prob. Real Authors",
+    "1 - Truth Ratio Real Authors",
+    "Prob. Real World",
+    "1 - Truth Ratio Real World",
+    "1 - Truth Ratio Retain",
 ]
 SUMMARY_TASKS = {
     "eval_real_author_wo_options.json": "Real Authors",
@@ -151,8 +154,8 @@ def eval_perturbation_ratio(eval_dataloader, perturb_dataloader, model, cfg=None
             del chunk_input_ids, chunk_labels, chunk_attention_mask
 
         perturb_loss = torch.cat(perturb_losses, dim=0).view(bsz, seq_len)
-        num_token_gt = (labels.cpu() != -100).sum(-1)
-        num_token_perturb = (flat_perturb_labels != -100).view(bsz, seq_len, -1).sum(-1)
+        num_token_gt = (labels.cpu() != -100).sum(-1).clamp_min(1)
+        num_token_perturb = (flat_perturb_labels != -100).view(bsz, seq_len, -1).sum(-1).clamp_min(1)
 
         mean_perturb_loss = perturb_loss.mean(dim=1)
 
@@ -164,10 +167,9 @@ def eval_perturbation_ratio(eval_dataloader, perturb_dataloader, model, cfg=None
         # eval_logs['ground_truth_loss'] = eval_logs.get('ground_truth_loss', []) + [gt_loss.mean().item()]
         # eval_logs['perturb_loss'] = eval_logs.get('perturb_loss', []) + [mean_perturb_loss.mean().item()]
 
-        perturb_loss_per_token = perturb_loss/num_token_perturb
-        gt_loss_per_token = gt_loss/num_token_gt
-        # truth_ratio = torch.exp(-1 * perturb_loss_per_token).mean(-1) / torch.exp(-1 * gt_loss_per_token)
-        truth_ratio = torch.exp(gt_loss_per_token - perturb_loss_per_token.mean(-1))
+        perturb_loss_per_token = perturb_loss / num_token_perturb
+        gt_loss_per_token = gt_loss / num_token_gt
+        truth_ratio = torch.exp(gt_loss_per_token.unsqueeze(-1) - perturb_loss_per_token).mean(-1)
 
 
         # zip index and each stat into a dict
@@ -277,13 +279,56 @@ def eval_chrf(gen_outputs, ground_truths):
     }
     return eval_result
 
+
+def _as_text_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+def _normalize_text_value(value, language, cfg):
+    return normalize_eval_text(
+        value,
+        language,
+        cfg_get(cfg, "unicode_normalization", None),
+        cfg_get(cfg, "normalize_languages", None),
+    )
+
+
+def _normalize_text_list(value, language, cfg):
+    return [_normalize_text_value(item, language, cfg) for item in _as_text_list(value)]
+
+
+def _dataloader_row_lookup(dataloader):
+    dataset = getattr(dataloader, "dataset", None)
+    data = getattr(dataset, "data", None)
+    if data is None:
+        return {}
+
+    lookup = {}
+    for row in data:
+        if "index" in row:
+            lookup[int(row["index"])] = row
+    return lookup
+
+
 def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_dataloader, perturb_dataloader, normalize_gt=False, language='en'):
     eval_logs = {}
+    compute_generation_metrics = bool(cfg_get(cfg, "compute_generation_metrics", True))
+    save_generated_text = bool(cfg_get(cfg, "save_generated_text", False))
+    collect_case_studies = bool(cfg_get(cfg, "save_case_studies", False)) and eval_task == "eval_log_forget"
+    need_generation = compute_generation_metrics or save_generated_text or collect_case_studies
 
     gen_outputs = []
     ground_truths = []
     input_strings = []
     all_indices = []
+    case_study_context = {}
+    raw_rows = _dataloader_row_lookup(eval_dataloader) if collect_case_studies else {}
 
     for batch in tqdm(eval_dataloader):
         input_ids, labels, attention_mask, indices = batch
@@ -298,29 +343,28 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
             logits = _forward_logits(model, batch["input_ids"], batch["attention_mask"])
             gt_loss = _batch_loss_from_logits(logits, batch['labels']).cpu()
             del logits
-            input_string, gen_output, gt = run_generation(cfg, batch, model, tokenizer=tokenizer, language=language)
-            gen_outputs.extend([
-                normalize_eval_text(
-                    text,
-                    language,
-                    cfg_get(cfg, "unicode_normalization", None),
-                    cfg_get(cfg, "normalize_languages", None),
-                )
-                for text in gen_output
-            ])
-            ground_truths.extend([
-                normalize_eval_text(
-                    text,
-                    language,
-                    cfg_get(cfg, "unicode_normalization", None),
-                    cfg_get(cfg, "normalize_languages", None),
-                )
-                for text in gt
-            ])
-            input_strings.extend(input_string)
+            input_string = [None] * len(indices)
+            gen_output = [None] * len(indices)
+            gt = [None] * len(indices)
+            normalized_gen_output = gen_output
+            normalized_gt = gt
+            if need_generation:
+                input_string, gen_output, gt = run_generation(cfg, batch, model, tokenizer=tokenizer, language=language)
+                normalized_gen_output = [
+                    _normalize_text_value(text, language, cfg)
+                    for text in gen_output
+                ]
+                normalized_gt = [
+                    _normalize_text_value(text, language, cfg)
+                    for text in gt
+                ]
+                if compute_generation_metrics:
+                    gen_outputs.extend(normalized_gen_output)
+                    ground_truths.extend(normalized_gt)
+                    input_strings.extend(input_string)
 
-        num_token_gt = (labels_cpu != -100).sum(-1)
-        gt_loss_per_token = gt_loss/num_token_gt
+        num_token_gt = (labels_cpu != -100).sum(-1).clamp_min(1)
+        gt_loss_per_token = gt_loss / num_token_gt
 
 
 
@@ -330,17 +374,36 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
             eval_logs['gt_loss'] = {}
         if 'num_token_gt' not in eval_logs:
             eval_logs['num_token_gt'] = {}
-        if 'generated_text' not in eval_logs:
+        if save_generated_text and 'generated_text' not in eval_logs:
             eval_logs['generated_text'] = {}
         # print(gt_loss.shape, num_token_gt.shape)
         eval_logs['avg_gt_loss'].update(dict(zip(indices.cpu().numpy().tolist(), gt_loss_per_token.cpu().numpy().tolist())))
         eval_logs['gt_loss'].update(dict(zip(indices.cpu().numpy().tolist(), gt_loss.cpu().numpy().tolist())))
         eval_logs['num_token_gt'].update(dict(zip(indices.cpu().numpy().tolist(), num_token_gt.cpu().numpy().tolist())))
-        eval_logs['generated_text'].update(dict(zip(indices.cpu().numpy().tolist(), zip(input_string, gen_output,gt))))
+        if save_generated_text:
+            eval_logs['generated_text'].update(dict(zip(indices.cpu().numpy().tolist(), zip(input_string, gen_output, gt))))
 
-    eval_logs.update(eval_chrf(gen_outputs, ground_truths))
-    eval_logs.update(eval_rouge_recall(gen_outputs, ground_truths, all_indices))
-    eval_logs.update(eval_bleu(gen_outputs, ground_truths))
+        if collect_case_studies:
+            for sample_idx, dataset_idx in enumerate(indices.cpu().numpy().tolist()):
+                row = raw_rows.get(int(dataset_idx), {})
+                question_values = _normalize_text_list(row.get("question"), language, cfg)
+                gold_answers = _normalize_text_list(row.get("answer"), language, cfg)
+                paraphrased_answers = _normalize_text_list(row.get("paraphrased_answer"), language, cfg)
+                perturbed_answers = _normalize_text_list(row.get("perturbed_answer"), language, cfg)
+                case_study_context[int(dataset_idx)] = {
+                    "language": language,
+                    "index": int(dataset_idx),
+                    "question": question_values[0] if question_values else None,
+                    "gold_answer": gold_answers[0] if gold_answers else (normalized_gt[sample_idx] if normalized_gt[sample_idx] is not None else None),
+                    "paraphrased_answer": paraphrased_answers[0] if paraphrased_answers else None,
+                    "perturbed_answers": perturbed_answers,
+                    "generated_output": normalized_gen_output[sample_idx] if normalized_gen_output[sample_idx] is not None else None,
+                }
+
+    if compute_generation_metrics and gen_outputs:
+        eval_logs.update(eval_chrf(gen_outputs, ground_truths))
+        eval_logs.update(eval_rouge_recall(gen_outputs, ground_truths, all_indices))
+        eval_logs.update(eval_bleu(gen_outputs, ground_truths))
     eval_logs.update(eval_perturbation_ratio(base_eval_dataloader, perturb_dataloader, model, cfg))
     
     if normalize_gt:
@@ -356,6 +419,9 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
             normalized_gt_loss[idx] = -1 * np.log(normalized_gt_prob)
 
         eval_logs['normalized_gt_loss'] = normalized_gt_loss
+
+    if collect_case_studies:
+        eval_logs["case_study_candidates"] = build_case_study_candidates(eval_logs, case_study_context)
 
     return eval_logs
 
@@ -406,13 +472,19 @@ def language_eval_cfg(cfg, language):
         "input_max_length": cfg_get(cfg, "input_max_length", cfg.generation.max_length),
         "unicode_normalization": cfg_get(cfg, "unicode_normalization", None),
         "normalize_languages": cfg_get(cfg, "normalize_languages", None),
-        "save_generated_text": cfg_get(cfg, "save_generated_text", True),
+        "save_generated_text": cfg_get(cfg, "save_generated_text", False),
         "ds_size": cfg_get(cfg, "ds_size", None),
         "overwrite": cfg_get(cfg, "overwrite", True),
         "use_pretrained": cfg_get(cfg, "use_pretrained", False),
         "batch_size": int(cfg_get(cfg, "batch_size", 4)),
         "perturb_eval_chunk_size": int(cfg_get(cfg, "perturb_eval_chunk_size", 1)),
         "retain_result": retain_result_for_language(cfg, language),
+        "save_raw_logs": bool(cfg_get(cfg, "save_raw_logs", False)),
+        "save_case_studies": bool(cfg_get(cfg, "save_case_studies", False)),
+        "case_study_k": int(cfg_get(cfg, "case_study_k", 3)),
+        "case_study_seed": int(cfg_get(cfg, "case_study_seed", 42)),
+        "compute_generation_metrics": bool(cfg_get(cfg, "compute_generation_metrics", False)),
+        "save_legacy_aggregate_stat": bool(cfg_get(cfg, "save_legacy_aggregate_stat", False)),
     }
     return OmegaConf.create(language_cfg)
 
@@ -449,40 +521,169 @@ def _common_keys(first, second):
     return [key for key in first.keys() if key in second]
 
 
+def _metric_value(metric_dict, key):
+    if metric_dict is None:
+        return None
+    if key in metric_dict:
+        return metric_dict[key]
+    str_key = str(key)
+    if str_key in metric_dict:
+        return metric_dict[str_key]
+    return None
+
+
+def _json_float_list(values):
+    result = []
+    for value in np.atleast_1d(np.array(values, dtype=np.float64)):
+        result.append(_json_float(value))
+    return result
+
+
+def build_case_study_candidates(eval_logs, contexts):
+    candidates = []
+    avg_gt_loss = eval_logs.get("avg_gt_loss", {})
+    avg_paraphrased_loss = eval_logs.get("avg_paraphrased_loss", {})
+    avg_perturb_loss = eval_logs.get("average_perturb_loss", {})
+
+    for index, context in contexts.items():
+        gt_loss = _metric_value(avg_gt_loss, index)
+        paraphrase_loss = _metric_value(avg_paraphrased_loss, index)
+        perturb_losses = _metric_value(avg_perturb_loss, index)
+        if gt_loss is None or paraphrase_loss is None or perturb_losses is None:
+            continue
+
+        gt_loss = float(gt_loss)
+        paraphrase_loss = float(paraphrase_loss)
+        perturb_losses = np.atleast_1d(np.array(perturb_losses, dtype=np.float64))
+        perturb_probs = np.exp(-perturb_losses)
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            truth_ratio_values = np.exp(np.clip(paraphrase_loss - perturb_losses, -745, 700))
+
+        record = {
+            **context,
+            "avg_gt_loss": _json_float(gt_loss),
+            "gt_prob": _json_float(np.exp(-gt_loss)),
+            "paraphrase_avg_nll": _json_float(paraphrase_loss),
+            "paraphrase_prob": _json_float(np.exp(-paraphrase_loss)),
+            "perturb_avg_nll": _json_float_list(perturb_losses),
+            "perturb_prob": _json_float(np.mean(perturb_probs)),
+            "perturb_probs": _json_float_list(perturb_probs),
+            "truth_ratio": _json_float(np.mean(truth_ratio_values)),
+            "truth_ratio_values": _json_float_list(truth_ratio_values),
+        }
+        candidates.append(record)
+
+    return candidates
+
+
+def _finite_metric(record, key, default):
+    value = record.get(key)
+    if value is None:
+        return default
+    value = float(value)
+    if np.isfinite(value):
+        return value
+    return default
+
+
+def select_case_studies(candidates, k, seed):
+    if not candidates:
+        return {
+            "worst_forget": [],
+            "best_forget": [],
+            "highest_gt_prob": [],
+            "random_seeded": [],
+        }
+
+    k = max(1, int(k))
+    worst_forget = sorted(
+        candidates,
+        key=lambda row: (
+            _finite_metric(row, "truth_ratio", np.inf),
+            -_finite_metric(row, "gt_prob", -np.inf),
+        ),
+    )[:k]
+
+    best_forget = sorted(
+        candidates,
+        key=lambda row: abs(np.log(max(_finite_metric(row, "truth_ratio", 0.0), 1e-12))),
+    )[:k]
+
+    highest_gt_prob = sorted(
+        candidates,
+        key=lambda row: _finite_metric(row, "gt_prob", -np.inf),
+        reverse=True,
+    )[:k]
+
+    rng = np.random.default_rng(int(seed))
+    random_indices = rng.choice(len(candidates), size=min(k, len(candidates)), replace=False)
+    random_seeded = [candidates[int(idx)] for idx in random_indices]
+
+    return {
+        "worst_forget": worst_forget,
+        "best_forget": best_forget,
+        "highest_gt_prob": highest_gt_prob,
+        "random_seeded": random_seeded,
+    }
+
+
+def write_case_study_files(save_dir, language, candidates, cfg):
+    if not candidates:
+        return
+
+    selected = select_case_studies(
+        candidates,
+        cfg_get(cfg, "case_study_k", 3),
+        cfg_get(cfg, "case_study_seed", 42),
+    )
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = {
+        "language": language,
+        "case_study_k": int(cfg_get(cfg, "case_study_k", 3)),
+        "case_study_seed": int(cfg_get(cfg, "case_study_seed", 42)),
+        "groups": selected,
+    }
+
+    with open(save_dir / "case_studies_forget.json", "w") as f:
+        json.dump(payload, f, indent=4, ensure_ascii=False)
+
+    with open(save_dir / "case_studies_forget.md", "w") as f:
+        f.write(f"# Forget Set Case Studies ({language})\n\n")
+        for group_name, records in selected.items():
+            f.write(f"## {group_name}\n\n")
+            for record in records:
+                f.write(f"### index {record.get('index')}\n\n")
+                f.write(f"- Truth ratio: {record.get('truth_ratio')}\n")
+                f.write(f"- Gold probability: {record.get('gt_prob')}\n")
+                f.write(f"- Paraphrase probability: {record.get('paraphrase_prob')}\n")
+                f.write(f"- Mean perturb probability: {record.get('perturb_prob')}\n\n")
+                f.write("Question:\n\n")
+                f.write(f"{record.get('question')}\n\n")
+                f.write("Gold answer:\n\n")
+                f.write(f"{record.get('gold_answer')}\n\n")
+                f.write("Generated output:\n\n")
+                f.write(f"{record.get('generated_output')}\n\n")
+                f.write("Paraphrased answer:\n\n")
+                f.write(f"{record.get('paraphrased_answer')}\n\n")
+                f.write("Perturbed answers:\n\n")
+                for answer in record.get("perturbed_answers", []):
+                    f.write(f"- {answer}\n")
+                f.write("\n")
+
+
 def _summary_probability(eval_logs, task_name):
     task_logs = eval_logs.get(task_name)
     if task_logs is None or "avg_gt_loss" not in task_logs:
         return None
 
     avg_gt_loss = task_logs["avg_gt_loss"]
-    if "eval_log" in task_name:
-        probs = _exp_neg(list(avg_gt_loss.values()))
-        return _json_float(np.mean(probs))
-
-    avg_perturb_loss = task_logs.get("average_perturb_loss")
-    if avg_perturb_loss is None:
-        return None
-
-    keys = _common_keys(avg_gt_loss, avg_perturb_loss)
-    if not keys:
-        return None
-
-    true_probs = _exp_neg([avg_gt_loss[key] for key in keys])
-    perturb_prob_sums = np.array([
-        np.sum(_exp_neg(avg_perturb_loss[key]))
-        for key in keys
-    ], dtype=np.float64)
-    all_probs = true_probs + perturb_prob_sums
-    normalized_true_probs = np.divide(
-        true_probs,
-        all_probs,
-        out=np.zeros_like(true_probs, dtype=np.float64),
-        where=all_probs != 0,
-    )
-    return _json_float(np.mean(normalized_true_probs))
+    probs = _exp_neg(list(avg_gt_loss.values()))
+    return _json_float(np.mean(probs))
 
 
-def _summary_truth_ratio(eval_logs, task_name):
+def _truth_ratio_values(eval_logs, task_name):
     task_logs = eval_logs.get(task_name)
     if task_logs is None:
         return None
@@ -496,24 +697,30 @@ def _summary_truth_ratio(eval_logs, task_name):
     if not keys:
         return None
 
-    paraphrase_losses = np.array([avg_paraphrased_loss[key] for key in keys], dtype=np.float64)
-    perturb_losses = np.array([
-        np.mean(np.array(avg_perturb_loss[key], dtype=np.float64))
-        for key in keys
-    ], dtype=np.float64)
+    truth_ratios = []
     with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
-        curr_stat = np.exp(np.clip(perturb_losses - paraphrase_losses, -745, 700))
-        inverse_stat = np.divide(
-            1.0,
-            curr_stat,
-            out=np.full_like(curr_stat, np.inf, dtype=np.float64),
-            where=curr_stat != 0,
-        )
-        if "forget" in task_name:
-            truth_ratio = np.mean(np.minimum(curr_stat, inverse_stat))
-        else:
-            truth_ratio = np.mean(np.maximum(0, 1 - inverse_stat))
-    return _json_float(truth_ratio)
+        for key in keys:
+            paraphrase_loss = float(avg_paraphrased_loss[key])
+            perturb_losses = np.array(avg_perturb_loss[key], dtype=np.float64)
+            perturb_losses = np.atleast_1d(perturb_losses)
+            ratios = np.exp(np.clip(paraphrase_loss - perturb_losses, -745, 700))
+            truth_ratios.append(np.mean(ratios))
+
+    return np.array(truth_ratios, dtype=np.float64)
+
+
+def _summary_truth_ratio(eval_logs, task_name):
+    truth_ratios = _truth_ratio_values(eval_logs, task_name)
+    if truth_ratios is None or truth_ratios.size == 0:
+        return None
+    return _json_float(np.mean(truth_ratios))
+
+
+def _summary_one_minus_truth_ratio(eval_logs, task_name):
+    truth_ratios = _truth_ratio_values(eval_logs, task_name)
+    if truth_ratios is None or truth_ratios.size == 0:
+        return None
+    return _json_float(np.mean(np.maximum(0, 1 - truth_ratios)))
 
 
 def _harmonic_mean(values):
@@ -534,23 +741,28 @@ def _load_retain_result(path):
 
 def build_summary_row(language, eval_logs, retain_result=None):
     row = {"language": language}
-    for task_name, task_label in SUMMARY_TASKS.items():
-        row[f"Prob. {task_label}"] = _summary_probability(eval_logs, task_name)
-        row[f"Truth Ratio {task_label}"] = _summary_truth_ratio(eval_logs, task_name)
+    row["Prob. Real Authors"] = _summary_probability(eval_logs, "eval_real_author_wo_options.json")
+    row["1 - Truth Ratio Real Authors"] = _summary_one_minus_truth_ratio(eval_logs, "eval_real_author_wo_options.json")
+    row["Prob. Real World"] = _summary_probability(eval_logs, "eval_real_world_wo_options.json")
+    row["1 - Truth Ratio Real World"] = _summary_one_minus_truth_ratio(eval_logs, "eval_real_world_wo_options.json")
+    row["Prob. Retain"] = _summary_probability(eval_logs, "eval_log.json")
+    row["1 - Truth Ratio Retain"] = _summary_one_minus_truth_ratio(eval_logs, "eval_log.json")
+    row["Prob. Forget"] = _summary_probability(eval_logs, "eval_log_forget.json")
+    row["Truth Ratio Forget"] = _summary_truth_ratio(eval_logs, "eval_log_forget.json")
 
     utility_values = [
         row["Prob. Real Authors"],
-        row["Truth Ratio Real Authors"],
+        row["1 - Truth Ratio Real Authors"],
         row["Prob. Real World"],
-        row["Truth Ratio Real World"],
+        row["1 - Truth Ratio Real World"],
         row["Prob. Retain"],
-        row["Truth Ratio Retain"],
+        row["1 - Truth Ratio Retain"],
     ]
     row["Model Utility"] = _harmonic_mean(utility_values)
-
-    row["Forget Quality"] = None
-    if retain_result is not None:
-        row["Forget Quality"] = _json_float(get_forget_quality(eval_logs, retain_result)["Forget Quality"])
+    row["MU"] = row["Model Utility"]
+    row["PR"] = row["Prob. Retain"]
+    row["PF"] = row["Prob. Forget"]
+    row["TRF"] = row["Truth Ratio Forget"]
 
     return {column: row.get(column) for column in SUMMARY_COLUMNS}
 
@@ -578,7 +790,7 @@ def write_summary_files(root_save_dir, rows):
         for row in rows
     ]
     with open(root_save_dir / "eval_summary.json", "w") as f:
-        json.dump(json_rows, f, indent=4)
+        json.dump(json_rows, f, indent=4, ensure_ascii=False)
 
     with open(root_save_dir / "eval_summary.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS)
@@ -594,6 +806,7 @@ def evaluate_one_language(model, tokenizer, cfg, language, save_dir):
     eval_cfg = language_eval_cfg(cfg, language)
     assert len(eval_cfg.data_path) == len(eval_cfg.split_list) == len(eval_cfg.eval_task) == len(eval_cfg.question_key) == len(eval_cfg.answer_key) == len(eval_cfg.base_answer_key) == len(eval_cfg.perturbed_answer_key), "data_path, split, eval_task, and answer key lists must have the same length"
     Path(save_dir).mkdir(parents=True, exist_ok=True)
+    save_raw_logs = bool(cfg_get(eval_cfg, "save_raw_logs", False))
 
     aggregated_eval_logs = {}
     for folder, split, question_key, answer_key, eval_task, base_answer_key, perturbed_answer_key in zip(
@@ -612,7 +825,7 @@ def evaluate_one_language(model, tokenizer, cfg, language, save_dir):
         save_filename = os.path.join(save_dir, f"{eval_task}.json")
         save_filename = save_filename if world_size == 1 else os.path.join(save_dir, f"{eval_task}_{os.environ.get('LOCAL_RANK', '0')}.json")
 
-        if os.path.exists(save_filename) and not eval_cfg.overwrite:
+        if save_raw_logs and os.path.exists(save_filename) and not eval_cfg.overwrite:
             print(f"Skipping {eval_task} because {save_filename} already exists")
             with open(save_filename, "r") as f:
                 aggregated_eval_logs[f"{eval_task}.json"] = json.load(f)
@@ -644,16 +857,28 @@ def evaluate_one_language(model, tokenizer, cfg, language, save_dir):
             language=language,
         )
 
-        with open(save_filename, "w") as f:
-            json.dump(eval_logs, f, indent=4)
+        if save_raw_logs:
+            with open(save_filename, "w") as f:
+                json.dump(eval_logs, f, indent=4, ensure_ascii=False)
+
+        if bool(cfg_get(eval_cfg, "save_case_studies", False)) and eval_task == "eval_log_forget":
+            write_case_study_files(
+                save_dir,
+                language,
+                eval_logs.get("case_study_candidates", []),
+                eval_cfg,
+            )
+            if not save_raw_logs:
+                eval_logs.pop("case_study_candidates", None)
 
         aggregated_eval_logs[f"{eval_task}.json"] = eval_logs
 
     aggregated_eval_log_filename = os.path.join(save_dir, "eval_log_aggregated.json")
-    with open(aggregated_eval_log_filename, "w") as f:
-        json.dump(aggregated_eval_logs, f, indent=4)
+    if save_raw_logs:
+        with open(aggregated_eval_log_filename, "w") as f:
+            json.dump(aggregated_eval_logs, f, indent=4, ensure_ascii=False)
 
-    if eval_cfg.retain_result is not None:
+    if bool(cfg_get(eval_cfg, "save_legacy_aggregate_stat", False)) and eval_cfg.retain_result is not None:
         retain_result = json.load(open(resolve_project_path(eval_cfg.retain_result), "r"))
         aggregate_stat = {**get_model_utility(aggregated_eval_logs), **get_forget_quality(aggregated_eval_logs, retain_result)}
         with open(os.path.join(save_dir, "aggregate_stat.csv"), "w") as f:
@@ -669,8 +894,10 @@ def evaluate_languages(model, tokenizer, cfg):
     multilingual = cfg_get(cfg, "languages", None) is not None
     all_logs = {}
     summary_rows = []
-    retain_logs_by_language = {}
     root_save_dir = Path(resolve_project_path(cfg.save_dir))
+    root_save_dir.mkdir(parents=True, exist_ok=True)
+    with open(root_save_dir / "resolved_eval_config.yaml", "w") as f:
+        f.write(OmegaConf.to_yaml(cfg, resolve=True))
 
     for language in languages:
         save_dir = root_save_dir
@@ -678,22 +905,14 @@ def evaluate_languages(model, tokenizer, cfg):
             save_dir = save_dir / language
         all_logs[language] = evaluate_one_language(model, tokenizer, cfg, language, save_dir)
 
-        retain_result_path = retain_result_for_language(cfg, language)
-        retain_result = _load_retain_result(retain_result_path) if retain_result_path is not None else None
-        if retain_result is not None:
-            retain_logs_by_language[language] = retain_result
-        summary_rows.append(build_summary_row(language, all_logs[language], retain_result))
+        summary_rows.append(build_summary_row(language, all_logs[language]))
 
-    if multilingual:
-        root_save_dir.mkdir(parents=True, exist_ok=True)
+    if multilingual and bool(cfg_get(cfg, "save_raw_logs", False)):
         with open(root_save_dir / "multilingual_aggregated.json", "w") as f:
-            json.dump(all_logs, f, indent=4)
+            json.dump(all_logs, f, indent=4, ensure_ascii=False)
 
     if len(languages) > 1:
-        combined_retain_result = None
-        if len(retain_logs_by_language) == len(languages):
-            combined_retain_result = combine_language_logs(retain_logs_by_language)
-        summary_rows.append(build_summary_row("total", combine_language_logs(all_logs), combined_retain_result))
+        summary_rows.append(build_summary_row("total", combine_language_logs(all_logs)))
 
     write_summary_files(root_save_dir, summary_rows)
 

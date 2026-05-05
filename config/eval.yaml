@@ -21,7 +21,13 @@ unicode_normalization: NFC
 normalize_languages:
   - hi
 
-save_generated_text: true
+save_raw_logs: false
+save_generated_text: false
+compute_generation_metrics: false
+save_case_studies: true
+case_study_k: 3
+case_study_seed: 42
+save_legacy_aggregate_stat: false
 ds_size: null
 overwrite: true
 batch_size: 4
