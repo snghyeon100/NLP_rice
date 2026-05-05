@@ -47,6 +47,7 @@ SUMMARY_TSV_COLUMNS = [
     "language",
     "Model Utility",
     "Prob. Retain",
+    "Truth Ratio Retain",
     "Prob. Forget",
     "Truth Ratio Forget",
 ]
@@ -928,7 +929,10 @@ def write_summary_files(root_save_dir, rows):
         json.dump(json_rows, f, indent=4, ensure_ascii=False)
 
     tsv_rows = [
-        {key: row.get(key) for key in SUMMARY_TSV_COLUMNS}
+        {
+            key: row.get("1 - Truth Ratio Retain") if key == "Truth Ratio Retain" else row.get(key)
+            for key in SUMMARY_TSV_COLUMNS
+        }
         for row in json_rows
     ]
     with open(root_save_dir / "eval_summary.txt", "w", newline="") as f:
