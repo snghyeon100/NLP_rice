@@ -34,18 +34,21 @@ DEFAULT_PERTURBED_ANSWER_KEYS = ["perturbed_answer", "perturbed_answer", "pertur
 SUMMARY_COLUMNS = [
     "language",
     "Model Utility",
-    "MU",
     "Prob. Retain",
-    "PR",
     "Prob. Forget",
-    "PF",
     "Truth Ratio Forget",
-    "TRF",
     "Prob. Real Authors",
     "1 - Truth Ratio Real Authors",
     "Prob. Real World",
     "1 - Truth Ratio Real World",
     "1 - Truth Ratio Retain",
+]
+SUMMARY_TSV_COLUMNS = [
+    "language",
+    "Model Utility",
+    "Prob. Retain",
+    "Prob. Forget",
+    "Truth Ratio Forget",
 ]
 SUMMARY_TASKS = {
     "eval_real_author_wo_options.json": "Real Authors",
@@ -891,10 +894,6 @@ def build_summary_row_from_accumulator(language, accumulator):
         row["1 - Truth Ratio Retain"],
     ]
     row["Model Utility"] = _harmonic_mean(utility_values)
-    row["MU"] = row["Model Utility"]
-    row["PR"] = row["Prob. Retain"]
-    row["PF"] = row["Prob. Forget"]
-    row["TRF"] = row["Truth Ratio Forget"]
 
     return {column: row.get(column) for column in SUMMARY_COLUMNS}
 
@@ -928,10 +927,14 @@ def write_summary_files(root_save_dir, rows):
     with open(root_save_dir / "eval_summary.json", "w") as f:
         json.dump(json_rows, f, indent=4, ensure_ascii=False)
 
-    with open(root_save_dir / "eval_summary.csv", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS)
+    tsv_rows = [
+        {key: row.get(key) for key in SUMMARY_TSV_COLUMNS}
+        for row in json_rows
+    ]
+    with open(root_save_dir / "eval_summary.tsv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_TSV_COLUMNS, delimiter="\t")
         writer.writeheader()
-        for row in json_rows:
+        for row in tsv_rows:
             writer.writerow({
                 key: "" if value is None else value
                 for key, value in row.items()
