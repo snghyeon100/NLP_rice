@@ -82,6 +82,51 @@ def answer_embeddings(model, answer_candidates):
     return pooled.detach(), candidate_mask, positive_mask
 
 
+def _answer_bank_tensors(answer_bank):
+    if hasattr(answer_bank, "as_tuple"):
+        return answer_bank.as_tuple()
+    if isinstance(answer_bank, dict):
+        candidate_mask = answer_bank.get("candidate_mask", None)
+        if candidate_mask is None:
+            candidate_mask = torch.ones_like(answer_bank["positive_mask"], dtype=torch.bool)
+        return (
+            answer_bank["input_ids"],
+            answer_bank["attention_mask"],
+            answer_bank["owner_indices"],
+            answer_bank["positive_mask"],
+            candidate_mask,
+        )
+    if len(answer_bank) == 4:
+        input_ids, attention_mask, owner_indices, positive_mask = answer_bank
+        candidate_mask = torch.ones_like(positive_mask, dtype=torch.bool)
+        return input_ids, attention_mask, owner_indices, positive_mask, candidate_mask
+    return answer_bank
+
+
+@torch.no_grad()
+def answer_bank_embeddings(model, answer_bank, chunk_size=256):
+    answer_input_ids, answer_attention_mask, owner_indices, positive_mask, candidate_mask = _answer_bank_tensors(answer_bank)
+    device = model_device(model)
+    answer_input_ids = answer_input_ids.to(device)
+    answer_attention_mask = answer_attention_mask.to(device)
+    owner_indices = owner_indices.to(device)
+    positive_mask = positive_mask.to(device)
+    candidate_mask = candidate_mask.to(device)
+
+    pooled_chunks = []
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, answer_input_ids.shape[0], chunk_size):
+        stop = min(start + chunk_size, answer_input_ids.shape[0])
+        ids = answer_input_ids[start:stop]
+        mask = answer_attention_mask[start:stop].float()
+        embeddings = model.get_input_embeddings()(ids)
+        pooled = (embeddings * mask.unsqueeze(-1)).sum(dim=1)
+        pooled = pooled / mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+        pooled_chunks.append(pooled.detach())
+
+    return torch.cat(pooled_chunks, dim=0), candidate_mask, owner_indices, positive_mask
+
+
 def question_hidden_states(model, question_inputs, layer_ids, pooling="last"):
     input_ids, attention_mask = batch_to_device(question_inputs, model_device(model))
     outputs = model(
@@ -103,8 +148,22 @@ def question_hidden_states(model, question_inputs, layer_ids, pooling="last"):
 def _score_matrix(projected_hidden, candidate_embeddings, temperature):
     projected = F.normalize(projected_hidden.float(), dim=-1)
     candidates = F.normalize(candidate_embeddings.float(), dim=-1)
-    flat_candidates = candidates.view(-1, candidates.shape[-1])
+    if candidates.dim() == 2:
+        flat_candidates = candidates
+    else:
+        flat_candidates = candidates.view(-1, candidates.shape[-1])
     return projected @ flat_candidates.transpose(0, 1) / float(temperature)
+
+
+def _bank_positive_matrix(sample_indices, owner_indices, positive_mask):
+    sample_indices = sample_indices.to(owner_indices.device).long()
+    owner_indices = owner_indices.long()
+    positive_matrix = owner_indices.unsqueeze(0).eq(sample_indices.unsqueeze(1))
+    positive_matrix = positive_matrix & positive_mask.bool().unsqueeze(0)
+    if not positive_matrix.any(dim=1).all():
+        missing = sample_indices[~positive_matrix.any(dim=1)].detach().cpu().tolist()
+        raise ValueError(f"Answer bank is missing positives for sample indices: {missing}")
+    return positive_matrix
 
 
 def contrastive_probe_loss(projected_hidden, candidate_embeddings, candidate_mask, positive_mask, temperature=0.07):
@@ -135,6 +194,39 @@ def contrastive_probe_loss(projected_hidden, candidate_embeddings, candidate_mas
     return loss, {"probe_acc": accuracy, "probe_positive_prob": positive_prob}
 
 
+def contrastive_probe_loss_bank(
+    projected_hidden,
+    bank_embeddings,
+    candidate_mask,
+    owner_indices,
+    bank_positive_mask,
+    sample_indices,
+    temperature=0.07,
+):
+    scores = _score_matrix(projected_hidden, bank_embeddings, temperature)
+    valid_mask = candidate_mask.reshape(-1).bool()
+    positive_matrix = _bank_positive_matrix(sample_indices, owner_indices, bank_positive_mask)
+
+    scores = scores.masked_fill(~valid_mask.unsqueeze(0), torch.finfo(scores.dtype).min)
+    positive_scores = scores.masked_fill(~positive_matrix, torch.finfo(scores.dtype).min)
+    log_positive = torch.logsumexp(positive_scores, dim=-1)
+    log_denominator = torch.logsumexp(scores, dim=-1)
+    loss = -(log_positive - log_denominator).mean()
+
+    with torch.no_grad():
+        preds = scores.argmax(dim=-1)
+        accuracy = positive_matrix.gather(1, preds.unsqueeze(1)).float().mean()
+        positive_prob = torch.exp(log_positive - log_denominator).mean()
+        valid_count = valid_mask.float().sum()
+        positive_count = positive_matrix.float().sum(dim=1).mean()
+    return loss, {
+        "probe_acc": accuracy,
+        "probe_positive_prob": positive_prob,
+        "probe_candidate_count": valid_count,
+        "probe_positive_count": positive_count,
+    }
+
+
 def uniform_probe_loss(projected_hidden, candidate_embeddings, candidate_mask, temperature=0.07):
     scores = _score_matrix(projected_hidden, candidate_embeddings, temperature)
     valid_scores = scores[:, candidate_mask.reshape(-1).bool()]
@@ -144,18 +236,57 @@ def uniform_probe_loss(projected_hidden, candidate_embeddings, candidate_mask, t
     return loss, {"probe_entropy": entropy}
 
 
-def probe_losses_for_layers(probes, hidden_by_layer, candidate_embeddings, candidate_mask, positive_mask, temperature):
+def positive_probability_erasure_loss(
+    projected_hidden,
+    bank_embeddings,
+    candidate_mask,
+    owner_indices,
+    bank_positive_mask,
+    sample_indices,
+    temperature=0.07,
+):
+    scores = _score_matrix(projected_hidden, bank_embeddings, temperature)
+    valid_mask = candidate_mask.reshape(-1).bool()
+    positive_matrix = _bank_positive_matrix(sample_indices, owner_indices, bank_positive_mask)
+    scores = scores.masked_fill(~valid_mask.unsqueeze(0), torch.finfo(scores.dtype).min)
+
+    positive_scores = scores.masked_fill(~positive_matrix, torch.finfo(scores.dtype).min)
+    log_positive = torch.logsumexp(positive_scores, dim=-1)
+    log_denominator = torch.logsumexp(scores, dim=-1)
+    positive_prob = torch.exp(log_positive - log_denominator)
+
+    valid_scores = scores[:, valid_mask]
+    log_probs = F.log_softmax(valid_scores, dim=-1)
+    entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+    return positive_prob.mean(), {
+        "probe_entropy": entropy.mean(),
+        "probe_positive_prob": positive_prob.mean(),
+    }
+
+
+def probe_losses_for_layers(
+    probes,
+    hidden_by_layer,
+    bank_embeddings,
+    candidate_mask,
+    owner_indices,
+    bank_positive_mask,
+    sample_indices,
+    temperature,
+):
     losses = {}
     metrics = {}
     for layer_id, hidden in hidden_by_layer.items():
         if str(layer_id) not in probes.probes:
             continue
         projected = probes(layer_id, hidden)
-        loss, layer_metrics = contrastive_probe_loss(
+        loss, layer_metrics = contrastive_probe_loss_bank(
             projected,
-            candidate_embeddings,
+            bank_embeddings,
             candidate_mask,
-            positive_mask,
+            owner_indices,
+            bank_positive_mask,
+            sample_indices,
             temperature=temperature,
         )
         losses[int(layer_id)] = loss
@@ -182,7 +313,7 @@ def load_probes(path, hidden_size, rank=64, map_location="cpu"):
     return probes
 
 
-def train_answer_probes(model, probes, dataloader, cfg, save_dir):
+def train_answer_probes(model, probes, dataloader, answer_bank, cfg, save_dir):
     probe_cfg = cfg.get("probe", {})
     temperature = float(probe_cfg.get("temperature", 0.07))
     pooling = probe_cfg.get("pooling", "last")
@@ -202,6 +333,11 @@ def train_answer_probes(model, probes, dataloader, cfg, save_dir):
         lr=float(probe_cfg.get("lr", 1e-3)),
         weight_decay=float(probe_cfg.get("weight_decay", 0.01)),
     )
+    bank_embeddings, bank_candidate_mask, bank_owner_indices, bank_positive_mask = answer_bank_embeddings(
+        model,
+        answer_bank,
+        chunk_size=int(probe_cfg.get("bank_embedding_batch_size", 256)),
+    )
 
     logs = []
     global_step = 0
@@ -213,18 +349,19 @@ def train_answer_probes(model, probes, dataloader, cfg, save_dir):
         for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"probe epoch {epoch + 1}/{num_epochs}")):
             if max_batches is not None and batch_idx >= max_batches:
                 break
-            forget_question, answer_candidates, *_ = batch
+            forget_question, sample_indices, *_ = batch
             with torch.no_grad():
-                candidates, candidate_mask, positive_mask = answer_embeddings(model, answer_candidates)
                 hidden_by_layer = question_hidden_states(model, forget_question, probes.layer_ids, pooling=pooling)
                 hidden_by_layer = {layer_id: hidden.detach() for layer_id, hidden in hidden_by_layer.items()}
 
             losses, metrics = probe_losses_for_layers(
                 probes,
                 hidden_by_layer,
-                candidates,
-                candidate_mask,
-                positive_mask,
+                bank_embeddings,
+                bank_candidate_mask,
+                bank_owner_indices,
+                bank_positive_mask,
+                sample_indices,
                 temperature=temperature,
             )
             if not losses:
@@ -266,7 +403,7 @@ def train_answer_probes(model, probes, dataloader, cfg, save_dir):
 
 
 @torch.no_grad()
-def evaluate_answer_probes(model, probes, dataloader, cfg, max_batches=None):
+def evaluate_answer_probes(model, probes, dataloader, answer_bank, cfg, max_batches=None):
     probes.eval()
     probes.to(model_device(model))
     pooling = cfg.get("probe", {}).get("pooling", "last")
@@ -276,19 +413,25 @@ def evaluate_answer_probes(model, probes, dataloader, cfg, max_batches=None):
         int(layer_id): {"loss": 0.0, "acc": 0.0, "positive_prob": 0.0, "count": 0}
         for layer_id in probes.layer_ids
     }
+    bank_embeddings, bank_candidate_mask, bank_owner_indices, bank_positive_mask = answer_bank_embeddings(
+        model,
+        answer_bank,
+        chunk_size=int(cfg.get("probe", {}).get("bank_embedding_batch_size", 256)),
+    )
 
     for batch_idx, batch in enumerate(dataloader):
         if max_batches is not None and batch_idx >= max_batches:
             break
-        forget_question, answer_candidates, *_ = batch
-        candidates, candidate_mask, positive_mask = answer_embeddings(model, answer_candidates)
+        forget_question, sample_indices, *_ = batch
         hidden_by_layer = question_hidden_states(model, forget_question, probes.layer_ids, pooling=pooling)
         losses, metrics = probe_losses_for_layers(
             probes,
             hidden_by_layer,
-            candidates,
-            candidate_mask,
-            positive_mask,
+            bank_embeddings,
+            bank_candidate_mask,
+            bank_owner_indices,
+            bank_positive_mask,
+            sample_indices,
             temperature=temperature,
         )
         for layer_id, loss in losses.items():

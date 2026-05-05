@@ -48,8 +48,12 @@ probe:
   max_batches: null
   max_positive_targets: 2
   use_paraphrase_positive: true
-  use_perturbed_negatives: false
-  max_negative_targets: 0
+  use_perturbed_negatives: true
+  max_negative_targets: 5
+  bank_include_paraphrase: true
+  bank_include_perturbed: true
+  max_perturbed_bank_per_sample: 5
+  bank_embedding_batch_size: 256
   log_every: 10
 
 localization:
@@ -71,6 +75,7 @@ erase:
   gradient_accumulation_steps: 1
   num_epochs: 5
   weight_decay: 0.01
+  probe_loss: positive_prob
   erase_weight: 1.0
   retain_ce_weight: 0.5
   utility_ce_weight: 0.5

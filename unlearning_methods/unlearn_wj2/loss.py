@@ -5,9 +5,10 @@ import torch.nn.functional as F
 
 from unlearning_methods.unlearn_wj2.probes import (
     _pool_hidden,
-    answer_embeddings,
+    answer_bank_embeddings,
     batch_to_device,
     model_device,
+    positive_probability_erasure_loss,
     question_hidden_states,
     uniform_probe_loss,
 )
@@ -99,42 +100,77 @@ def forget_hidden_norm_loss(model, reference_model, forget_question, layer_ids, 
     return torch.stack(losses).mean()
 
 
-def compute_probe_erasure_loss(model, probes, forget_question, answer_candidates, layer_ids, temperature, pooling):
-    candidates, candidate_mask, _ = answer_embeddings(model, answer_candidates)
+def compute_probe_erasure_loss(
+    model,
+    probes,
+    forget_question,
+    sample_indices,
+    answer_bank,
+    layer_ids,
+    temperature,
+    pooling,
+    loss_type="positive_prob",
+    bank_embedding_batch_size=256,
+):
+    bank_embeddings, candidate_mask, owner_indices, bank_positive_mask = answer_bank_embeddings(
+        model,
+        answer_bank,
+        chunk_size=bank_embedding_batch_size,
+    )
     hidden_by_layer = question_hidden_states(model, forget_question, layer_ids, pooling=pooling)
     losses = []
     entropies = []
+    positive_probs = []
     for layer_id, hidden in hidden_by_layer.items():
         if str(layer_id) not in probes.probes:
             continue
         projected = probes(layer_id, hidden)
-        loss, metrics = uniform_probe_loss(
-            projected,
-            candidates,
-            candidate_mask,
-            temperature=temperature,
-        )
+        if loss_type == "uniform":
+            loss, metrics = uniform_probe_loss(
+                projected,
+                bank_embeddings,
+                candidate_mask,
+                temperature=temperature,
+            )
+            positive_prob = torch.zeros((), device=loss.device)
+        elif loss_type == "positive_prob":
+            loss, metrics = positive_probability_erasure_loss(
+                projected,
+                bank_embeddings,
+                candidate_mask,
+                owner_indices,
+                bank_positive_mask,
+                sample_indices,
+                temperature=temperature,
+            )
+            positive_prob = metrics["probe_positive_prob"]
+        else:
+            raise ValueError(f"Unknown erase.probe_loss={loss_type}. Use 'positive_prob' or 'uniform'.")
         losses.append(loss)
         entropies.append(metrics["probe_entropy"])
+        positive_probs.append(positive_prob)
     if not losses:
         raise ValueError("No probe erasure losses were produced. Check selected layers and probe layers.")
-    return torch.stack(losses).mean(), torch.stack(entropies).mean()
+    return torch.stack(losses).mean(), torch.stack(entropies).mean(), torch.stack(positive_probs).mean()
 
 
-def compute_rep_erasure_loss(model, reference_model, probes, inputs, cfg, selected_layers):
-    forget_question, answer_candidates, retain_inputs, utility_inputs, _, _ = inputs
+def compute_rep_erasure_loss(model, reference_model, probes, inputs, cfg, selected_layers, answer_bank):
+    forget_question, sample_indices, retain_inputs, utility_inputs, _, _ = inputs
     erase_cfg = cfg.get("erase", {})
     probe_cfg = cfg.get("probe", {})
     selected_layers = [int(layer_id) for layer_id in selected_layers]
 
-    erase_loss, probe_entropy = compute_probe_erasure_loss(
+    erase_loss, probe_entropy, probe_positive_prob = compute_probe_erasure_loss(
         model,
         probes,
         forget_question,
-        answer_candidates,
+        sample_indices,
+        answer_bank,
         selected_layers,
         temperature=float(probe_cfg.get("temperature", 0.07)),
         pooling=probe_cfg.get("pooling", "last"),
+        loss_type=erase_cfg.get("probe_loss", "positive_prob"),
+        bank_embedding_batch_size=int(probe_cfg.get("bank_embedding_batch_size", 256)),
     )
     retain_outputs = forward_outputs(model, retain_inputs)
     utility_outputs = forward_outputs(model, utility_inputs)
@@ -176,6 +212,7 @@ def compute_rep_erasure_loss(model, reference_model, probes, inputs, cfg, select
         "objective_loss": loss.detach(),
         "erase_loss": erase_loss.detach(),
         "probe_entropy": probe_entropy.detach(),
+        "probe_positive_prob": probe_positive_prob.detach(),
         "retain_loss": retain_outputs.loss.detach(),
         "utility_loss": utility_outputs.loss.detach(),
         "retain_kl": retain_kl.detach(),

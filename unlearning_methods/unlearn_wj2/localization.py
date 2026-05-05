@@ -9,9 +9,9 @@ import torch
 import torch.nn.functional as F
 
 from unlearning_methods.unlearn_wj2.probes import (
-    answer_embeddings,
+    answer_bank_embeddings,
     batch_to_device,
-    contrastive_probe_loss,
+    contrastive_probe_loss_bank,
     model_device,
     question_hidden_states,
 )
@@ -105,8 +105,8 @@ def _score_layer_gradients(model, loss, layer_ids, target_modules=None, eps=1e-1
 
 
 @torch.no_grad()
-def _probe_decodability_scores(model, probes, forget_question, answer_candidates, layer_ids, cfg):
-    candidates, candidate_mask, positive_mask = answer_embeddings(model, answer_candidates)
+def _probe_decodability_scores(model, probes, forget_question, sample_indices, bank_cache, layer_ids, cfg):
+    bank_embeddings, candidate_mask, owner_indices, bank_positive_mask = bank_cache
     hidden_by_layer = question_hidden_states(
         model,
         forget_question,
@@ -119,11 +119,13 @@ def _probe_decodability_scores(model, probes, forget_question, answer_candidates
         if str(layer_id) not in probes.probes:
             continue
         projected = probes(layer_id, hidden)
-        loss, metrics = contrastive_probe_loss(
+        loss, metrics = contrastive_probe_loss_bank(
             projected,
-            candidates,
+            bank_embeddings,
             candidate_mask,
-            positive_mask,
+            owner_indices,
+            bank_positive_mask,
+            sample_indices,
             temperature=temperature,
         )
         # Higher score means the layer encodes the target answer more recoverably.
@@ -182,7 +184,7 @@ def _restore_requires_grad(model, previous):
             param.requires_grad = previous[name]
 
 
-def run_localization(model, probes, dataloader, cfg, save_dir):
+def run_localization(model, probes, dataloader, answer_bank, cfg, save_dir):
     loc_cfg = cfg.get("localization", {})
     layer_ids = [int(layer_id) for layer_id in probes.layer_ids]
     if not layer_ids:
@@ -200,17 +202,23 @@ def run_localization(model, probes, dataloader, cfg, save_dir):
     previous_requires_grad = _set_model_requires_grad(model, True)
     model.train()
     probes.eval()
+    bank_cache = answer_bank_embeddings(
+        model,
+        answer_bank,
+        chunk_size=int(cfg.get("probe", {}).get("bank_embedding_batch_size", 256)),
+    )
     try:
         for batch_idx, batch in enumerate(dataloader):
             if batch_idx >= max_batches:
                 break
-            forget_question, answer_candidates, retain_inputs, utility_inputs, parallel_en_inputs, parallel_tgt_inputs = batch
+            forget_question, sample_indices, retain_inputs, utility_inputs, parallel_en_inputs, parallel_tgt_inputs = batch
 
             dec_scores = _probe_decodability_scores(
                 model,
                 probes,
                 forget_question,
-                answer_candidates,
+                sample_indices,
+                bank_cache,
                 layer_ids,
                 cfg,
             )

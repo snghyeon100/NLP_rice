@@ -1,5 +1,6 @@
 """Datasets for probe-based representation erasure."""
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import datasets
@@ -9,6 +10,28 @@ from torch.utils.data import Dataset
 
 from data_module import convert_raw_data_to_model_format
 from utils import get_model_identifiers_from_yaml
+
+
+@dataclass
+class AnswerBank:
+    """Tokenized global answer candidates used by probe training and erasure."""
+
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    owner_indices: torch.Tensor
+    positive_mask: torch.Tensor
+    texts: list
+    source_types: list
+
+    def as_tuple(self):
+        valid_mask = torch.ones_like(self.positive_mask, dtype=torch.bool)
+        return (
+            self.input_ids,
+            self.attention_mask,
+            self.owner_indices,
+            self.positive_mask,
+            valid_mask,
+        )
 
 
 def _as_plain(value):
@@ -157,7 +180,7 @@ def _as_text_list(value):
 
 
 class RepErasureDataset(Dataset):
-    """Return forget question-only inputs, answer candidates, and preserve batches."""
+    """Return forget question-only inputs, sample ids, and preserve batches."""
 
     def __init__(self, cfg, tokenizer, model_family):
         super().__init__()
@@ -177,6 +200,11 @@ class RepErasureDataset(Dataset):
         self.max_negative_targets = int(_get(probe_cfg, "max_negative_targets", 0))
         self.use_paraphrase_positive = bool(_get(probe_cfg, "use_paraphrase_positive", True))
         self.use_perturbed_negatives = bool(_get(probe_cfg, "use_perturbed_negatives", False))
+        self.bank_include_paraphrase = bool(_get(probe_cfg, "bank_include_paraphrase", self.use_paraphrase_positive))
+        self.bank_include_perturbed = bool(_get(probe_cfg, "bank_include_perturbed", self.use_perturbed_negatives))
+        self.max_perturbed_bank_per_sample = int(
+            _get(probe_cfg, "max_perturbed_bank_per_sample", max(0, self.max_negative_targets))
+        )
 
         self.forget_data = load_qa_dataset(cfg.forget_data_path, cfg.get("forget_split", cfg.get("split", None)))
         self.forget_probe_data = load_qa_dataset(
@@ -205,6 +233,7 @@ class RepErasureDataset(Dataset):
             self.parallel_tgt_data = load_qa_dataset(parallel_cfg.tgt, _get(parallel_cfg.tgt, "split"))
             self.parallel_en_language = _get(parallel_cfg.en, "language", "en")
             self.parallel_tgt_language = _get(parallel_cfg.tgt, "language", self.target_language)
+        self.answer_bank = self._build_answer_bank()
 
     def __len__(self):
         return len(self.forget_probe_data)
@@ -260,6 +289,69 @@ class RepErasureDataset(Dataset):
         candidate_mask = [1] * self.max_positive_targets + [idx < original_negative_count for idx in range(self.max_negative_targets)]
         return candidates, positive_mask, candidate_mask
 
+    def _positive_texts(self, row):
+        positives = [row[self.answer_key]]
+        if self.bank_include_paraphrase and self.paraphrased_answer_key in row:
+            positives.extend(_as_text_list(row.get(self.paraphrased_answer_key)))
+        return _dedupe_texts(positives)[:self.max_positive_targets]
+
+    def _perturbed_texts(self, row):
+        if not self.bank_include_perturbed or self.perturbed_answer_key not in row:
+            return []
+        perturbed = _dedupe_texts(_as_text_list(row.get(self.perturbed_answer_key)))
+        if self.max_perturbed_bank_per_sample <= 0:
+            return perturbed
+        return perturbed[:self.max_perturbed_bank_per_sample]
+
+    def _build_answer_bank(self):
+        input_ids = []
+        attention_masks = []
+        owner_indices = []
+        positive_mask = []
+        texts = []
+        source_types = []
+
+        for sample_idx, row in enumerate(self.forget_probe_data):
+            positive_texts = self._positive_texts(row)
+            if not positive_texts:
+                continue
+            for text_idx, text in enumerate(positive_texts):
+                ids, mask = answer_to_model_format(self.tokenizer, self.answer_max_length, text)
+                input_ids.append(ids)
+                attention_masks.append(mask)
+                owner_indices.append(sample_idx)
+                positive_mask.append(True)
+                texts.append(text)
+                source_types.append("answer" if text_idx == 0 else "paraphrased_answer")
+
+            for text in self._perturbed_texts(row):
+                ids, mask = answer_to_model_format(self.tokenizer, self.answer_max_length, text)
+                input_ids.append(ids)
+                attention_masks.append(mask)
+                owner_indices.append(sample_idx)
+                positive_mask.append(False)
+                texts.append(text)
+                source_types.append("perturbed_answer")
+
+        if not input_ids:
+            raise ValueError("Answer bank is empty. Check answer_key/paraphrased_answer_key in forget_probe_data.")
+
+        bank = AnswerBank(
+            input_ids=torch.stack(input_ids),
+            attention_mask=torch.stack(attention_masks),
+            owner_indices=torch.tensor(owner_indices, dtype=torch.long),
+            positive_mask=torch.tensor(positive_mask, dtype=torch.bool),
+            texts=texts,
+            source_types=source_types,
+        )
+        owner_count = int(bank.owner_indices.unique().numel())
+        positive_count = int(bank.positive_mask.sum().item())
+        if bank.input_ids.shape[0] == positive_count and owner_count <= 1:
+            raise ValueError(
+                "Answer bank has no negatives. Use more than one forget sample or enable bank_include_perturbed."
+            )
+        return bank
+
     def _candidate_convert(self, row):
         candidates, positive_mask, candidate_mask = self._candidate_texts(row)
         answer_ids = []
@@ -286,7 +378,7 @@ class RepErasureDataset(Dataset):
         utility_row = self.utility_data[utility_idx]
 
         forget_question = self._question_convert(forget_row, "en")
-        answer_candidates = self._candidate_convert(forget_row)
+        sample_index = torch.tensor(idx, dtype=torch.long)
         retain_inputs = self._qa_convert(retain_row, "en")
         utility_inputs = self._qa_convert(
             utility_row,
@@ -296,7 +388,7 @@ class RepErasureDataset(Dataset):
         parallel_tgt_inputs = self._question_convert(self.parallel_tgt_data[parallel_tgt_idx], self.parallel_tgt_language)
         return (
             forget_question,
-            answer_candidates,
+            sample_index,
             retain_inputs,
             utility_inputs,
             parallel_en_inputs,
@@ -310,14 +402,14 @@ def _stack_tuple(samples):
 
 def rep_erasure_collator(samples):
     forget_questions = _stack_tuple([sample[0] for sample in samples])
-    answer_candidates = _stack_tuple([sample[1] for sample in samples])
+    sample_indices = torch.stack([sample[1] for sample in samples]).long()
     retain_inputs = _stack_tuple([sample[2] for sample in samples])
     utility_inputs = _stack_tuple([sample[3] for sample in samples])
     parallel_en_inputs = _stack_tuple([sample[4] for sample in samples])
     parallel_tgt_inputs = _stack_tuple([sample[5] for sample in samples])
     return (
         forget_questions,
-        answer_candidates,
+        sample_indices,
         retain_inputs,
         utility_inputs,
         parallel_en_inputs,

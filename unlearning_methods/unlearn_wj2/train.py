@@ -65,6 +65,7 @@ class RepErasureTrainer(Trainer):
         *args,
         reference_model=None,
         probes=None,
+        answer_bank=None,
         cfg=None,
         selected_layers=None,
         loss_log_path=None,
@@ -72,6 +73,7 @@ class RepErasureTrainer(Trainer):
     ):
         self.reference_model = reference_model
         self.probes = probes
+        self.answer_bank = answer_bank
         self.cfg = cfg
         self.selected_layers = [int(layer_id) for layer_id in selected_layers]
         self.loss_log_path = Path(loss_log_path) if loss_log_path is not None else None
@@ -95,6 +97,7 @@ class RepErasureTrainer(Trainer):
             inputs,
             self.cfg,
             self.selected_layers,
+            self.answer_bank,
         )
         loss_logs = {key: float(value.detach().cpu()) for key, value in logs.items()}
         for key, value in loss_logs.items():
@@ -258,6 +261,24 @@ def save_probe_audit(path, stage, audit):
         f.write(json.dumps({"stage": stage, "audit": audit}) + "\n")
 
 
+def save_answer_bank_summary(path, answer_bank):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    source_counts = {}
+    for source_type in answer_bank.source_types:
+        source_counts[source_type] = source_counts.get(source_type, 0) + 1
+    payload = {
+        "num_entries": int(answer_bank.input_ids.shape[0]),
+        "num_samples": int(answer_bank.owner_indices.unique().numel()),
+        "num_positive_entries": int(answer_bank.positive_mask.sum().item()),
+        "num_negative_entries": int((~answer_bank.positive_mask).sum().item()),
+        "source_counts": source_counts,
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Answer bank: {payload}")
+
+
 @hydra.main(version_base=None, config_path=".", config_name="config")
 def main(cfg):
     os.chdir(PROJECT_ROOT)
@@ -278,6 +299,7 @@ def main(cfg):
     tokenizer.pad_token = tokenizer.eos_token
 
     dataset = RepErasureDataset(cfg, tokenizer=tokenizer, model_family=cfg.model_family)
+    save_answer_bank_summary(Path(cfg.save_dir) / "answer_bank_summary.json", dataset.answer_bank)
     probe_loader = _make_loader(dataset, cfg, shuffle=True, batch_size=cfg.erase.batch_size)
     localization_loader = _make_loader(dataset, cfg, shuffle=False, batch_size=cfg.erase.batch_size)
 
@@ -307,7 +329,7 @@ def main(cfg):
         probes = LayerProbeBank(candidate_layers, hidden_size, rank=int(cfg.probe.get("hidden_rank", 64)))
 
     if cfg.probe.get("train", True) and not cfg.probe.get("load_path", None):
-        probes = train_answer_probes(model, probes, probe_loader, cfg, Path(cfg.save_dir) / "probes")
+        probes = train_answer_probes(model, probes, probe_loader, dataset.answer_bank, cfg, Path(cfg.save_dir) / "probes")
     else:
         probes.to(_device_for_main_model())
 
@@ -315,6 +337,7 @@ def main(cfg):
         model,
         probes,
         localization_loader,
+        dataset.answer_bank,
         cfg,
         max_batches=cfg.localization.get("num_batches", 8),
     )
@@ -323,7 +346,7 @@ def main(cfg):
     if cfg.localization.get("selected_layers_path", None):
         selected_layers = load_selected_layers(resolve_project_path(cfg.localization.selected_layers_path))
     elif cfg.localization.get("run", True):
-        selected_layers, _ = run_localization(model, probes, localization_loader, cfg, cfg.save_dir)
+        selected_layers, _ = run_localization(model, probes, localization_loader, dataset.answer_bank, cfg, cfg.save_dir)
     else:
         selected_layers = candidate_layers[: int(cfg.localization.get("select_top_k_layers", len(candidate_layers)))]
     print(f"Selected layers for erasure: {selected_layers}")
@@ -355,6 +378,7 @@ def main(cfg):
         data_collator=rep_erasure_collator,
         reference_model=reference_model,
         probes=probes,
+        answer_bank=dataset.answer_bank,
         cfg=cfg,
         selected_layers=selected_layers,
         loss_log_path=Path(cfg.save_dir) / "training_loss_history.jsonl",
@@ -365,6 +389,7 @@ def main(cfg):
         model,
         probes,
         localization_loader,
+        dataset.answer_bank,
         cfg,
         max_batches=cfg.localization.get("num_batches", 8),
     )
