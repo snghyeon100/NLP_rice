@@ -25,6 +25,7 @@ save_generated_text: true
 ds_size: null
 overwrite: true
 batch_size: 4
+perturb_eval_chunk_size: 1
 reinitialize_weights: false
 
 question_key: [question, question, question, question]

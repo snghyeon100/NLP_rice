@@ -1,8 +1,6 @@
 from tqdm import tqdm
 from data_module import (
     TextDatasetQAStat,
-    custom_data_collator,
-    get_batch_loss,
     custom_data_collator_with_indices,
     normalize_eval_text,
 )
@@ -90,38 +88,71 @@ def infer_languages(cfg):
     return [cfg_get(cfg, "language", "en")]
 
 
+def _forward_logits(model, input_ids, attention_mask):
+    return model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+    ).logits
 
-def eval_perturbation_ratio(eval_dataloader, perturb_dataloader, model):
+
+def _batch_loss_from_logits(logits, labels):
+    shifted_labels = labels[..., 1:].contiguous()
+    shifted_logits = logits[..., :-1, :]
+    valid_mask = shifted_labels != -100
+    batch_size = shifted_labels.shape[0]
+    loss = torch.zeros(batch_size, device=logits.device, dtype=torch.float32)
+    if not valid_mask.any():
+        return loss
+
+    token_logits = shifted_logits[valid_mask].float()
+    token_labels = shifted_labels[valid_mask]
+    token_losses = torch.nn.functional.cross_entropy(token_logits, token_labels, reduction="none")
+    row_ids = torch.arange(batch_size, device=logits.device).unsqueeze(1).expand_as(shifted_labels)[valid_mask]
+    loss.index_add_(0, row_ids, token_losses)
+    return loss
+
+
+def eval_perturbation_ratio(eval_dataloader, perturb_dataloader, model, cfg=None):
     eval_logs = {}
+    perturb_chunk_size = int(cfg_get(cfg, "perturb_eval_chunk_size", 1))
+    perturb_chunk_size = max(1, perturb_chunk_size)
     for batch, perturb_batch in tqdm(zip(eval_dataloader, perturb_dataloader)):
         input_ids, labels, attention_mask, indices = batch
-        batch = {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
+        input_ids = input_ids.to(model.device)
+        labels = labels.to(model.device)
+        attention_mask = attention_mask.to(model.device)
         perturb_input_ids, perturb_labels, perturb_attention_mask, _ = perturb_batch
         if len(perturb_input_ids.shape) > 2:
             bsz, seq_len = perturb_input_ids.shape[0:2]
         else:
             bsz = perturb_input_ids.shape[0]
             seq_len = 1
-        perturb_batch = {"input_ids": perturb_input_ids.view(bsz*seq_len, -1), "labels": perturb_labels.view(bsz*seq_len, -1), "attention_mask": perturb_attention_mask.view(bsz*seq_len, -1)}
+        flat_perturb_input_ids = perturb_input_ids.reshape(bsz * seq_len, -1)
+        flat_perturb_labels = perturb_labels.reshape(bsz * seq_len, -1)
+        flat_perturb_attention_mask = perturb_attention_mask.reshape(bsz * seq_len, -1)
 
+        with torch.inference_mode():
+            logits = _forward_logits(model, input_ids, attention_mask)
+            gt_loss = _batch_loss_from_logits(logits, labels).cpu()
+            del logits
 
-        #send to device
-        for k, v in batch.items():
-            batch[k] = v.to(model.device)
-        for k, v in perturb_batch.items():
-            perturb_batch[k] = v.to(model.device)
+        perturb_losses = []
+        for start in range(0, flat_perturb_input_ids.shape[0], perturb_chunk_size):
+            stop = min(start + perturb_chunk_size, flat_perturb_input_ids.shape[0])
+            chunk_input_ids = flat_perturb_input_ids[start:stop].to(model.device)
+            chunk_labels = flat_perturb_labels[start:stop].to(model.device)
+            chunk_attention_mask = flat_perturb_attention_mask[start:stop].to(model.device)
+            with torch.inference_mode():
+                logits = _forward_logits(model, chunk_input_ids, chunk_attention_mask)
+                chunk_loss = _batch_loss_from_logits(logits, chunk_labels).cpu()
+                del logits
+            perturb_losses.append(chunk_loss)
+            del chunk_input_ids, chunk_labels, chunk_attention_mask
 
-
-        with torch.no_grad():
-            outputs = model(**batch)
-            perturb_outputs = model(**perturb_batch)
-
-        gt_loss = get_batch_loss(outputs.logits, batch['labels'])
-        perturb_loss = get_batch_loss(perturb_outputs.logits, perturb_batch['labels']).view(bsz, seq_len)
-        gt_loss = gt_loss.to(torch.float32)
-        perturb_loss = perturb_loss.to(torch.float32)
-        num_token_gt = (batch['labels']!=-100).sum(-1)
-        num_token_perturb = (perturb_batch['labels']!=-100).view(bsz, seq_len, -1).sum(-1)
+        perturb_loss = torch.cat(perturb_losses, dim=0).view(bsz, seq_len)
+        num_token_gt = (labels.cpu() != -100).sum(-1)
+        num_token_perturb = (flat_perturb_labels != -100).view(bsz, seq_len, -1).sum(-1)
 
         mean_perturb_loss = perturb_loss.mean(dim=1)
 
@@ -257,13 +288,16 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
     for batch in tqdm(eval_dataloader):
         input_ids, labels, attention_mask, indices = batch
         all_indices.extend(indices.cpu().numpy().tolist())
+        labels_cpu = labels
         batch = {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
         #send to device
         for k, v in batch.items():
             batch[k] = v.to(model.device)
 
-        with torch.no_grad():
-            outputs = model(**batch)
+        with torch.inference_mode():
+            logits = _forward_logits(model, batch["input_ids"], batch["attention_mask"])
+            gt_loss = _batch_loss_from_logits(logits, batch['labels']).cpu()
+            del logits
             input_string, gen_output, gt = run_generation(cfg, batch, model, tokenizer=tokenizer, language=language)
             gen_outputs.extend([
                 normalize_eval_text(
@@ -284,10 +318,8 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
                 for text in gt
             ])
             input_strings.extend(input_string)
-            
-        gt_loss = get_batch_loss(outputs.logits, batch['labels'])
-        gt_loss = gt_loss.to(torch.float32)
-        num_token_gt = (batch['labels']!=-100).sum(-1)
+
+        num_token_gt = (labels_cpu != -100).sum(-1)
         gt_loss_per_token = gt_loss/num_token_gt
 
 
@@ -309,7 +341,7 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
     eval_logs.update(eval_chrf(gen_outputs, ground_truths))
     eval_logs.update(eval_rouge_recall(gen_outputs, ground_truths, all_indices))
     eval_logs.update(eval_bleu(gen_outputs, ground_truths))
-    eval_logs.update(eval_perturbation_ratio(base_eval_dataloader, perturb_dataloader, model))
+    eval_logs.update(eval_perturbation_ratio(base_eval_dataloader, perturb_dataloader, model, cfg))
     
     if normalize_gt:
         avg_gt_loss = eval_logs['avg_gt_loss']
@@ -379,6 +411,7 @@ def language_eval_cfg(cfg, language):
         "overwrite": cfg_get(cfg, "overwrite", True),
         "use_pretrained": cfg_get(cfg, "use_pretrained", False),
         "batch_size": int(cfg_get(cfg, "batch_size", 4)),
+        "perturb_eval_chunk_size": int(cfg_get(cfg, "perturb_eval_chunk_size", 1)),
         "retain_result": retain_result_for_language(cfg, language),
     }
     return OmegaConf.create(language_cfg)
