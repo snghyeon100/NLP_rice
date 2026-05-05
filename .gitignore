@@ -40,3 +40,6 @@ finetuned/*
 
 # RCP-LoRA artifacts
 unlearning_methods/unlearn_sh/*.md
+
+results/
+logs/
