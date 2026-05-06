@@ -1,0 +1,11 @@
+model_family: qwen3_5_2b
+
+data_path: ./dataset/retain99_merged_all_10_lang
+batch_size: 1
+gradient_accumulation_steps: 8
+num_epochs: 5
+lr: 2e-5
+save_dir: ./finetuned/finetuned_99
+
+weight_decay: 0.01
+seed: 42
