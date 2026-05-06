@@ -43,7 +43,7 @@ SUMMARY_COLUMNS = [
     "1 - Truth Ratio Real World",
     "1 - Truth Ratio Retain",
 ]
-SUMMARY_TSV_COLUMNS = [
+SUMMARY_CSV_COLUMNS = [
     "language",
     "Model Utility",
     "Prob. Retain",
@@ -751,13 +751,38 @@ def write_case_study_files(save_dir, language, candidates, cfg, dataloader=None,
                 f.write("\n")
 
 
-def _summary_probability(eval_logs, task_name):
+def _probability_values(eval_logs, task_name):
     task_logs = eval_logs.get(task_name)
     if task_logs is None or "avg_gt_loss" not in task_logs:
         return None
 
     avg_gt_loss = task_logs["avg_gt_loss"]
-    probs = _exp_neg(list(avg_gt_loss.values()))
+    if "eval_log" in task_name:
+        return _exp_neg(list(avg_gt_loss.values()))
+
+    avg_perturb_loss = task_logs.get("average_perturb_loss")
+    if avg_perturb_loss is None:
+        return None
+
+    keys = _common_keys(avg_gt_loss, avg_perturb_loss)
+    if not keys:
+        return None
+
+    probs = []
+    for key in keys:
+        true_prob = float(_exp_neg([avg_gt_loss[key]])[0])
+        false_probs = _exp_neg(np.atleast_1d(avg_perturb_loss[key]))
+        all_prob = true_prob + float(np.sum(false_probs))
+        if all_prob > 0 and np.isfinite(all_prob):
+            probs.append(true_prob / all_prob)
+
+    return np.array(probs, dtype=np.float64)
+
+
+def _summary_probability(eval_logs, task_name):
+    probs = _probability_values(eval_logs, task_name)
+    if probs is None or probs.size == 0:
+        return None
     return _json_float(np.mean(probs))
 
 
@@ -781,8 +806,9 @@ def _truth_ratio_values(eval_logs, task_name):
             paraphrase_loss = float(avg_paraphrased_loss[key])
             perturb_losses = np.array(avg_perturb_loss[key], dtype=np.float64)
             perturb_losses = np.atleast_1d(perturb_losses)
-            ratios = np.exp(np.clip(paraphrase_loss - perturb_losses, -745, 700))
-            truth_ratios.append(np.mean(ratios))
+            mean_perturb_loss = float(np.mean(perturb_losses))
+            ratio = np.exp(np.clip(paraphrase_loss - mean_perturb_loss, -745, 700))
+            truth_ratios.append(ratio)
 
     return np.array(truth_ratios, dtype=np.float64)
 
@@ -791,6 +817,9 @@ def _summary_truth_ratio(eval_logs, task_name):
     truth_ratios = _truth_ratio_values(eval_logs, task_name)
     if truth_ratios is None or truth_ratios.size == 0:
         return None
+    if "forget" in task_name:
+        with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+            truth_ratios = np.minimum(truth_ratios, 1 / truth_ratios)
     return _json_float(np.mean(truth_ratios))
 
 
@@ -833,16 +862,22 @@ def build_summary_accumulator(eval_logs):
             "one_minus_truth_ratio_count": 0,
         })
 
-        avg_gt_loss = task_logs.get("avg_gt_loss")
-        if avg_gt_loss:
-            probs = _exp_neg(list(avg_gt_loss.values()))
+        probs = _probability_values(eval_logs, task_name)
+        if probs is not None and probs.size > 0:
             task_acc["prob_sum"] += float(np.sum(probs))
             task_acc["prob_count"] += int(probs.size)
 
         truth_ratios = _truth_ratio_values(eval_logs, task_name)
         if truth_ratios is not None and truth_ratios.size > 0:
-            task_acc["truth_ratio_sum"] += float(np.sum(truth_ratios))
-            task_acc["truth_ratio_count"] += int(truth_ratios.size)
+            if "forget" in task_name:
+                with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                    summary_truth_ratios = np.minimum(truth_ratios, 1 / truth_ratios)
+            else:
+                summary_truth_ratios = truth_ratios
+            finite_truth_ratios = summary_truth_ratios[np.isfinite(summary_truth_ratios)]
+            if finite_truth_ratios.size > 0:
+                task_acc["truth_ratio_sum"] += float(np.sum(finite_truth_ratios))
+                task_acc["truth_ratio_count"] += int(finite_truth_ratios.size)
             one_minus = np.maximum(0, 1 - truth_ratios)
             task_acc["one_minus_truth_ratio_sum"] += float(np.sum(one_minus))
             task_acc["one_minus_truth_ratio_count"] += int(one_minus.size)
@@ -928,17 +963,17 @@ def write_summary_files(root_save_dir, rows):
     with open(root_save_dir / "eval_summary.json", "w") as f:
         json.dump(json_rows, f, indent=4, ensure_ascii=False)
 
-    tsv_rows = [
+    csv_rows = [
         {
             key: row.get("1 - Truth Ratio Retain") if key == "Truth Ratio Retain" else row.get(key)
-            for key in SUMMARY_TSV_COLUMNS
+            for key in SUMMARY_CSV_COLUMNS
         }
         for row in json_rows
     ]
-    with open(root_save_dir / "eval_summary.txt", "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=SUMMARY_TSV_COLUMNS, delimiter="\t")
+    with open(root_save_dir / "eval_summary.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_CSV_COLUMNS)
         writer.writeheader()
-        for row in tsv_rows:
+        for row in csv_rows:
             writer.writerow({
                 key: "" if value is None else value
                 for key, value in row.items()
