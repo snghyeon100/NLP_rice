@@ -27,6 +27,7 @@ reproduce.ipynb
 upload_to_hf.py
 TODO.md
 eval/
+.venv/
 
 # Logs
 *.log
