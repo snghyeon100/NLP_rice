@@ -172,6 +172,14 @@ def attach_lora(model, cfg, selected_layers):
     target_modules = collect_lora_target_modules(model, target_leaves, selected_layers)
     print(f"LoRA selected layers: {selected_layers}")
     print(f"LoRA target module count: {len(target_modules)}")
+    target_count_by_layer = {}
+    for module_name in target_modules:
+        if "layers." not in module_name:
+            continue
+        layer_idx = int(module_name.split("layers.")[1].split(".")[0])
+        target_count_by_layer[layer_idx] = target_count_by_layer.get(layer_idx, 0) + 1
+    print(f"LoRA target count by layer: {target_count_by_layer}")
+    print(f"LoRA target modules: {target_modules}")
 
     lora_config = LoraConfig(
         r=int(cfg.lora_r),

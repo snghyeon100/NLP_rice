@@ -46,6 +46,41 @@ def select_middle_layers(num_layers, top_k, min_layer=None, max_layer=None):
     return sorted(selected)
 
 
+def layers_with_target_modules(model, target_leaves, min_layer=None, max_layer=None):
+    target_leaves = set(str(name) for name in target_leaves)
+    allowed = set(layer_window(get_num_layers(model), min_layer=min_layer, max_layer=max_layer))
+    layers = set()
+    counts = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        leaf = name.split(".")[-1]
+        if leaf not in target_leaves or leaf == "lm_head":
+            continue
+        layer_idx = extract_layer_idx(name)
+        if layer_idx is None or layer_idx not in allowed:
+            continue
+        layers.add(layer_idx)
+        counts[layer_idx] = counts.get(layer_idx, 0) + 1
+    return sorted(layers), counts
+
+
+def select_middle_target_layers(model, target_leaves, top_k, min_layer=None, max_layer=None):
+    candidates, counts = layers_with_target_modules(
+        model,
+        target_leaves,
+        min_layer=min_layer,
+        max_layer=max_layer,
+    )
+    if not candidates:
+        raise ValueError(f"No layers contain target modules: {list(target_leaves)}")
+    if top_k >= len(candidates):
+        return candidates, counts
+    center = (candidates[0] + candidates[-1]) / 2.0
+    selected = sorted(candidates, key=lambda idx: (abs(idx - center), idx))[: int(top_k)]
+    return sorted(selected), counts
+
+
 def _batch_to_device(inputs, device):
     return tuple(tensor.to(device) for tensor in inputs)
 
@@ -129,6 +164,30 @@ def select_layers(model, cfg, tokenizer, project_root, save_dir):
         scores = {
             layer: {
                 "middle_distance": abs(layer - ((selected[0] + selected[-1]) / 2.0)) if selected else 0.0,
+                "selected": layer in selected,
+            }
+            for layer in range(num_layers)
+        }
+    elif strategy == "middle_targets":
+        target_leaves = cfg.get("lora_target_modules", None)
+        if target_leaves is None:
+            target_leaves = sorted(
+                {
+                    name.split(".")[-1]
+                    for name, module in model.named_modules()
+                    if isinstance(module, torch.nn.Linear) and name.split(".")[-1] != "lm_head"
+                }
+            )
+        selected, target_counts = select_middle_target_layers(
+            model,
+            target_leaves,
+            top_k,
+            min_layer=min_layer,
+            max_layer=max_layer,
+        )
+        scores = {
+            layer: {
+                "target_module_count": target_counts.get(layer, 0),
                 "selected": layer in selected,
             }
             for layer in range(num_layers)

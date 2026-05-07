@@ -61,7 +61,7 @@ loss_weights:
 # Layer selection controls. `middle` is cheap and robust. Switch to
 # `hidden_alignment` to score source-target hidden similarity before LoRA attach.
 layer_selection:
-  strategy: middle  # manual | middle | hidden_alignment
+  strategy: middle_targets  # manual | middle | middle_targets | hidden_alignment
   selected_layers: null
   top_k: 6
   min_layer: 4
