@@ -22,7 +22,7 @@ def sequence_nll(model, inputs):
     """Return per-example answer-token NLL sums and token counts."""
     input_ids, labels, attention_mask = batch_to_device(inputs, model_device(model))
     outputs = model(input_ids=input_ids, labels=labels, attention_mask=attention_mask)
-    logits = outputs.logits[..., :-1, :].contiguous()
+    logits = outputs.logits[..., :-1, :].float().contiguous()
     shifted_labels = labels[..., 1:].contiguous()
     token_loss = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")(
         logits.transpose(-1, -2),
@@ -32,6 +32,11 @@ def sequence_nll(model, inputs):
     nll_sum = (token_loss * mask).sum(dim=-1)
     token_count = mask.sum(dim=-1).clamp_min(1)
     return nll_sum, token_count, outputs
+
+
+def answer_ce_loss(model, inputs):
+    nll_sum, token_count, outputs = sequence_nll(model, inputs)
+    return (nll_sum / token_count).mean(), outputs
 
 
 def npo_forget_loss(model, ref_model, inputs, beta):
@@ -53,8 +58,8 @@ def npo_forget_loss(model, ref_model, inputs, beta):
 
 
 def negative_ce_forget_loss(model, inputs):
-    outputs = forward_outputs(model, inputs)
-    return -outputs.loss, outputs, {"forget_ce": outputs.loss.detach()}
+    ce_loss, outputs = answer_ce_loss(model, inputs)
+    return -ce_loss, outputs, {"forget_ce": ce_loss.detach()}
 
 
 def masked_kl(model, ref_model, inputs):
@@ -66,14 +71,14 @@ def masked_kl(model, ref_model, inputs):
     if mask.sum().item() == 0:
         return outputs.logits.sum() * 0.0
 
-    current_logits = outputs.logits[..., :-1, :][mask].contiguous()
+    current_logits = outputs.logits[..., :-1, :][mask].float().contiguous()
     current_log_probs = F.log_softmax(current_logits, dim=-1)
 
     with torch.no_grad():
         ref_input_ids, _, ref_attention_mask = batch_to_device(inputs, model_device(ref_model))
         ref_outputs = ref_model(input_ids=ref_input_ids, attention_mask=ref_attention_mask)
         ref_mask = mask.to(model_device(ref_model))
-        ref_logits = ref_outputs.logits[..., :-1, :][ref_mask].contiguous()
+        ref_logits = ref_outputs.logits[..., :-1, :][ref_mask].float().contiguous()
         ref_log_probs = F.log_softmax(ref_logits, dim=-1)
         ref_log_probs = ref_log_probs.to(model_device(model))
 
@@ -115,19 +120,19 @@ def compute_wj_loss(model, ref_model, batch, cfg):
     logs["loss_forget"] = forget_loss.detach()
 
     if float(weights.retain_source_ce) != 0:
-        retain_source_outputs = forward_outputs(model, batch["retain_source"])
-        total = _weighted_add(total, weights.retain_source_ce, retain_source_outputs.loss)
-        logs["loss_retain_source_ce"] = retain_source_outputs.loss.detach()
+        retain_source_loss, _ = answer_ce_loss(model, batch["retain_source"])
+        total = _weighted_add(total, weights.retain_source_ce, retain_source_loss)
+        logs["loss_retain_source_ce"] = retain_source_loss.detach()
 
     if float(weights.retain_multi_ce) != 0:
-        retain_multi_outputs = forward_outputs(model, batch["retain_multi"])
-        total = _weighted_add(total, weights.retain_multi_ce, retain_multi_outputs.loss)
-        logs["loss_retain_multi_ce"] = retain_multi_outputs.loss.detach()
+        retain_multi_loss, _ = answer_ce_loss(model, batch["retain_multi"])
+        total = _weighted_add(total, weights.retain_multi_ce, retain_multi_loss)
+        logs["loss_retain_multi_ce"] = retain_multi_loss.detach()
 
     if float(weights.utility_multi_ce) != 0:
-        utility_multi_outputs = forward_outputs(model, batch["utility_multi"])
-        total = _weighted_add(total, weights.utility_multi_ce, utility_multi_outputs.loss)
-        logs["loss_utility_multi_ce"] = utility_multi_outputs.loss.detach()
+        utility_multi_loss, _ = answer_ce_loss(model, batch["utility_multi"])
+        total = _weighted_add(total, weights.utility_multi_ce, utility_multi_loss)
+        logs["loss_utility_multi_ce"] = utility_multi_loss.detach()
 
     if float(weights.retain_source_kl) != 0:
         retain_source_kl = masked_kl(model, ref_model, batch["retain_source"])

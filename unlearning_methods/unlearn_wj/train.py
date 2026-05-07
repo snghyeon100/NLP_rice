@@ -251,6 +251,7 @@ def main(cfg):
         [param for param in model.parameters() if param.requires_grad],
         lr=float(cfg.lr),
         weight_decay=float(cfg.weight_decay),
+        eps=float(cfg.adam_epsilon),
     )
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
@@ -272,16 +273,34 @@ def main(cfg):
             batch = move_batch_to_device(batch, train_device)
 
             loss, _, logs = compute_wj_loss(model, ref_model, batch, cfg)
+            if not torch.isfinite(loss):
+                message = f"Non-finite loss at step {global_step}: {logs}"
+                if bool(cfg.abort_on_nonfinite):
+                    raise FloatingPointError(message)
+                print(f"[warning] {message}; skipping update")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
             scaled_loss = loss / int(cfg.gradient_accumulation_steps)
             scaled_loss.backward()
 
             should_step = global_step % int(cfg.gradient_accumulation_steps) == 0 or global_step == max_steps
             if should_step:
+                trainable_params = [param for param in model.parameters() if param.requires_grad]
+                nonfinite_grad = False
+                for param in trainable_params:
+                    if param.grad is not None and not torch.isfinite(param.grad).all():
+                        nonfinite_grad = True
+                        break
+                if nonfinite_grad:
+                    message = f"Non-finite gradient at step {global_step}: {logs}"
+                    if bool(cfg.abort_on_nonfinite):
+                        raise FloatingPointError(message)
+                    print(f"[warning] {message}; skipping update")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
                 if float(cfg.max_grad_norm) > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        [param for param in model.parameters() if param.requires_grad],
-                        float(cfg.max_grad_norm),
-                    )
+                    torch.nn.utils.clip_grad_norm_(trainable_params, float(cfg.max_grad_norm))
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
