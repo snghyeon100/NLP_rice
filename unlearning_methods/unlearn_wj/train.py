@@ -109,6 +109,15 @@ def cast_trainable_parameters(model, dtype):
                 param.grad = param.grad.to(dtype=dtype)
 
 
+def freeze_lora_a_parameters(model):
+    frozen = []
+    for name, param in model.named_parameters():
+        if ".lora_A." in name:
+            param.requires_grad = False
+            frozen.append(name)
+    return frozen
+
+
 def first_nonfinite_gradient(model):
     for name, param in model.named_parameters():
         grad = param.grad
@@ -191,6 +200,9 @@ def attach_lora(model, cfg, selected_layers):
     )
     model = get_peft_model(model, lora_config)
     cast_trainable_parameters(model, parse_torch_dtype(cfg.trainable_param_dtype))
+    frozen_lora_a = freeze_lora_a_parameters(model) if bool(cfg.freeze_lora_A) else []
+    if frozen_lora_a:
+        print(f"Frozen LoRA A parameter count: {len(frozen_lora_a)}")
     model.print_trainable_parameters()
     return model, target_modules
 
