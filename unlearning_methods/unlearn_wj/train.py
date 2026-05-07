@@ -24,7 +24,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedul
 
 from unlearning_methods.unlearn_wj.dataloader import WJUnlearningDataset, wj_collator
 from unlearning_methods.unlearn_wj.localization import collect_lora_target_modules, select_layers
-from unlearning_methods.unlearn_wj.loss import compute_wj_loss
+from unlearning_methods.unlearn_wj.loss import iter_wj_loss_terms
 from utils import get_model_identifiers_from_yaml
 
 
@@ -321,17 +321,32 @@ def main(cfg):
             global_step += 1
             batch = move_batch_to_device(batch, train_device)
 
-            loss, _, logs = compute_wj_loss(model, ref_model, batch, cfg)
-            if not torch.isfinite(loss):
-                message = f"Non-finite loss at step {global_step}: {logs}"
-                if bool(cfg.abort_on_nonfinite):
-                    raise FloatingPointError(message)
-                print(f"[warning] {message}; skipping update")
-                optimizer.zero_grad(set_to_none=True)
-                continue
+            logs = {}
+            total_loss_value = 0.0
+            skip_update = False
+            for name, weight, term_loss, extra_logs in iter_wj_loss_terms(model, ref_model, batch, cfg):
+                weighted_loss = float(weight) * term_loss
+                logs[name] = float(term_loss.detach().float().cpu())
+                logs.update({key: float(value.detach().float().cpu()) for key, value in extra_logs.items()})
+                total_loss_value += float(weighted_loss.detach().float().cpu())
 
-            scaled_loss = loss / int(cfg.gradient_accumulation_steps)
-            scaled_loss.backward()
+                if float(weight) == 0.0:
+                    continue
+                if not torch.isfinite(weighted_loss):
+                    message = f"Non-finite {name} at step {global_step}: {logs}"
+                    if bool(cfg.abort_on_nonfinite):
+                        raise FloatingPointError(message)
+                    print(f"[warning] {message}; skipping update")
+                    optimizer.zero_grad(set_to_none=True)
+                    skip_update = True
+                    break
+
+                scaled_loss = weighted_loss / int(cfg.gradient_accumulation_steps)
+                scaled_loss.backward()
+
+            if skip_update:
+                continue
+            logs["loss_total"] = total_loss_value
 
             should_step = global_step % int(cfg.gradient_accumulation_steps) == 0 or global_step == max_steps
             if should_step:

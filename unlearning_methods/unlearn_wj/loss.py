@@ -97,10 +97,9 @@ def _weighted_add(total, weight, value):
     return total + float(weight) * value
 
 
-def compute_wj_loss(model, ref_model, batch, cfg):
+def iter_wj_loss_terms(model, ref_model, batch, cfg):
     weights = cfg.loss_weights
     objective = str(cfg.forget_objective).lower()
-    logs = {}
 
     if objective == "npo":
         forget_loss, outputs, forget_logs = npo_forget_loss(
@@ -109,45 +108,48 @@ def compute_wj_loss(model, ref_model, batch, cfg):
             batch["forget_source"],
             beta=float(cfg.npo_beta),
         )
-        logs.update(forget_logs)
+        yield "loss_forget", float(weights.forget), forget_loss, forget_logs
     elif objective in {"neg_ce", "grad_diff"}:
         forget_loss, outputs, forget_logs = negative_ce_forget_loss(model, batch["forget_source"])
-        logs.update(forget_logs)
+        yield "loss_forget", float(weights.forget), forget_loss, forget_logs
     else:
         raise ValueError(f"Unsupported forget_objective: {cfg.forget_objective}")
 
-    total = float(weights.forget) * forget_loss
-    logs["loss_forget"] = forget_loss.detach()
-
     if float(weights.retain_source_ce) != 0:
         retain_source_loss, _ = answer_ce_loss(model, batch["retain_source"])
-        total = _weighted_add(total, weights.retain_source_ce, retain_source_loss)
-        logs["loss_retain_source_ce"] = retain_source_loss.detach()
+        yield "loss_retain_source_ce", float(weights.retain_source_ce), retain_source_loss, {}
 
     if float(weights.retain_multi_ce) != 0:
         retain_multi_loss, _ = answer_ce_loss(model, batch["retain_multi"])
-        total = _weighted_add(total, weights.retain_multi_ce, retain_multi_loss)
-        logs["loss_retain_multi_ce"] = retain_multi_loss.detach()
+        yield "loss_retain_multi_ce", float(weights.retain_multi_ce), retain_multi_loss, {}
 
     if float(weights.utility_multi_ce) != 0:
         utility_multi_loss, _ = answer_ce_loss(model, batch["utility_multi"])
-        total = _weighted_add(total, weights.utility_multi_ce, utility_multi_loss)
-        logs["loss_utility_multi_ce"] = utility_multi_loss.detach()
+        yield "loss_utility_multi_ce", float(weights.utility_multi_ce), utility_multi_loss, {}
 
     if float(weights.retain_source_kl) != 0:
         retain_source_kl = masked_kl(model, ref_model, batch["retain_source"])
-        total = _weighted_add(total, weights.retain_source_kl, retain_source_kl)
-        logs["loss_retain_source_kl"] = retain_source_kl.detach()
+        yield "loss_retain_source_kl", float(weights.retain_source_kl), retain_source_kl, {}
 
     if float(weights.retain_multi_kl) != 0:
         retain_multi_kl = masked_kl(model, ref_model, batch["retain_multi"])
-        total = _weighted_add(total, weights.retain_multi_kl, retain_multi_kl)
-        logs["loss_retain_multi_kl"] = retain_multi_kl.detach()
+        yield "loss_retain_multi_kl", float(weights.retain_multi_kl), retain_multi_kl, {}
 
     if float(weights.utility_multi_kl) != 0:
         utility_multi_kl = masked_kl(model, ref_model, batch["utility_multi"])
-        total = _weighted_add(total, weights.utility_multi_kl, utility_multi_kl)
-        logs["loss_utility_multi_kl"] = utility_multi_kl.detach()
+        yield "loss_utility_multi_kl", float(weights.utility_multi_kl), utility_multi_kl, {}
 
+
+def compute_wj_loss(model, ref_model, batch, cfg):
+    total = None
+    logs = {}
+    outputs = None
+    for name, weight, term_loss, extra_logs in iter_wj_loss_terms(model, ref_model, batch, cfg):
+        weighted = weight * term_loss
+        total = weighted if total is None else total + weighted
+        logs[name] = term_loss.detach()
+        logs.update(extra_logs)
+    if total is None:
+        raise ValueError("WJ loss has no active terms.")
     logs["loss_total"] = total.detach()
     return total, outputs, {key: float(value.detach().float().cpu()) for key, value in logs.items()}
