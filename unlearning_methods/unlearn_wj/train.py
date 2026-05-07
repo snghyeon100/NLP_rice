@@ -343,6 +343,18 @@ def main(cfg):
 
                 scaled_loss = weighted_loss / int(cfg.gradient_accumulation_steps)
                 scaled_loss.backward()
+                bad_grad = first_nonfinite_gradient(model)
+                if bad_grad is not None:
+                    message = (
+                        f"Non-finite gradient after {name} backward at step {global_step}: "
+                        f"bad_grad={bad_grad}, logs={logs}"
+                    )
+                    if bool(cfg.abort_on_nonfinite):
+                        raise FloatingPointError(message)
+                    print(f"[warning] {message}; skipping update")
+                    optimizer.zero_grad(set_to_none=True)
+                    skip_update = True
+                    break
 
             if skip_update:
                 continue

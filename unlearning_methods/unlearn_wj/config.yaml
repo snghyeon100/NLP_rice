@@ -39,7 +39,7 @@ seed: 42
 # Precision and device placement. On Titan XP use fp16=true, bf16=false.
 bf16: false
 fp16: true
-gradient_checkpointing: true
+gradient_checkpointing: false
 trainable_param_dtype: float32
 gpu_train: 0
 gpu_ref: 1
@@ -63,7 +63,7 @@ loss_weights:
 layer_selection:
   strategy: middle  # manual | middle | hidden_alignment
   selected_layers: null
-  top_k: 12
+  top_k: 6
   min_layer: 4
   max_layer: null
   hidden_alignment_batches: 8
@@ -71,17 +71,14 @@ layer_selection:
 
 # PEFT LoRA. Selected-layer LoRA is the default update mechanism.
 use_lora: true
-lora_r: 16
-lora_alpha: 32
+lora_r: 8
+lora_alpha: 16
 lora_dropout: 0.05
 lora_target_modules:
   - q_proj
   - k_proj
   - v_proj
   - o_proj
-  - gate_proj
-  - up_proj
-  - down_proj
 
 save_dir: ./finetuned/${method_name}_${forget_objective}_${lr}_${forget_split}_${num_epochs}_${source_language}
 lora_save_dir: ${save_dir}/lora_adapter
