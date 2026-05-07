@@ -58,6 +58,17 @@ def pick_dtype(cfg):
     return torch.float32
 
 
+def parse_torch_dtype(value):
+    value = str(value).lower()
+    if value in {"float32", "fp32"}:
+        return torch.float32
+    if value in {"float16", "fp16"}:
+        return torch.float16
+    if value in {"bfloat16", "bf16"}:
+        return torch.bfloat16
+    raise ValueError(f"Unsupported dtype: {value}")
+
+
 def ensure_save_dir(cfg):
     save_dir = Path(cfg.save_dir)
     if save_dir.exists() and any(save_dir.iterdir()) and not bool(cfg.overwrite_dir):
@@ -88,6 +99,41 @@ def count_trainable_parameters(model):
         "trainable_fraction": trainable / max(1, total),
         "trainable_tensors": tensors,
     }
+
+
+def cast_trainable_parameters(model, dtype):
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(dtype=dtype)
+            if param.grad is not None:
+                param.grad = param.grad.to(dtype=dtype)
+
+
+def first_nonfinite_gradient(model):
+    for name, param in model.named_parameters():
+        grad = param.grad
+        if grad is None or torch.isfinite(grad).all():
+            continue
+        finite = grad[torch.isfinite(grad)].detach().float()
+        stats = {
+            "name": name,
+            "shape": list(grad.shape),
+            "dtype": str(grad.dtype),
+            "numel": grad.numel(),
+            "finite_count": finite.numel(),
+            "nan_count": torch.isnan(grad).sum().item(),
+            "inf_count": torch.isinf(grad).sum().item(),
+        }
+        if finite.numel() > 0:
+            stats.update(
+                {
+                    "finite_min": finite.min().item(),
+                    "finite_max": finite.max().item(),
+                    "finite_norm": finite.norm().item(),
+                }
+            )
+        return stats
+    return None
 
 
 def move_batch_to_device(batch, device):
@@ -136,6 +182,7 @@ def attach_lora(model, cfg, selected_layers):
         task_type=TaskType.CAUSAL_LM,
     )
     model = get_peft_model(model, lora_config)
+    cast_trainable_parameters(model, parse_torch_dtype(cfg.trainable_param_dtype))
     model.print_trainable_parameters()
     return model, target_modules
 
@@ -219,7 +266,7 @@ def main(cfg):
     for param in ref_model.parameters():
         param.requires_grad = False
 
-    if model_cfg["gradient_checkpointing"] == "true":
+    if bool(cfg.gradient_checkpointing):
         model.gradient_checkpointing_enable()
     model.config.use_cache = False
 
@@ -231,10 +278,12 @@ def main(cfg):
         save_dir=Path(cfg.save_dir) / "localization",
     )
     model, target_modules = attach_lora(model, cfg, selected_layers)
-    if model_cfg["gradient_checkpointing"] == "true":
+    if bool(cfg.gradient_checkpointing):
         model.gradient_checkpointing_enable()
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
+    else:
+        model.gradient_checkpointing_disable()
     model.config.use_cache = False
 
     trainable_info = count_trainable_parameters(model)
@@ -287,13 +336,10 @@ def main(cfg):
             should_step = global_step % int(cfg.gradient_accumulation_steps) == 0 or global_step == max_steps
             if should_step:
                 trainable_params = [param for param in model.parameters() if param.requires_grad]
-                nonfinite_grad = False
-                for param in trainable_params:
-                    if param.grad is not None and not torch.isfinite(param.grad).all():
-                        nonfinite_grad = True
-                        break
+                bad_grad = first_nonfinite_gradient(model)
+                nonfinite_grad = bad_grad is not None
                 if nonfinite_grad:
-                    message = f"Non-finite gradient at step {global_step}: {logs}"
+                    message = f"Non-finite gradient at step {global_step}: bad_grad={bad_grad}, logs={logs}"
                     if bool(cfg.abort_on_nonfinite):
                         raise FloatingPointError(message)
                     print(f"[warning] {message}; skipping update")
