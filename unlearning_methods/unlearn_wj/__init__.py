@@ -1,2 +1,2 @@
-"""Subspace-aware zero-shot cross-lingual unlearning."""
+"""WJ zero-shot cross-lingual likelihood unlearning method."""
 

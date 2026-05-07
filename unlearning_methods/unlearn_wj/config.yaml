@@ -1,153 +1,98 @@
+# WJ: zero-shot cross-lingual likelihood unlearning
+#
+# Run from repo root:
+#   CUDA_VISIBLE_DEVICES=0,1 python unlearning_methods/unlearn_wj/train.py
+
 model_family: qwen3_5_2b
-model_path: ./finetuned
-reference_model_path: ${model_path}
-method_name: subspace_xlingual
+model_path: ./finetuned/finetuned_100
+method_name: wj
 
-language: en
+# Source forget supervision. Target-language forget data is evaluation-only.
+source_language: en
 target_languages: [ko]
-primary_target_language: ko
-split: forget01
-retain_split: retain99
+forget_split: forget01
+source_retain_split: retain99
+source_data_path: locuslab/TOFU
 
-forget_data_path: locuslab/TOFU
-forget_split: ${split}
-retain_data_path: locuslab/TOFU
-utility_data_path: ./dataset/full_merged_all_10_lang
-
-parallel_utility_data_path:
-  en:
-    path: locuslab/TOFU
-    split: ${retain_split}
-    language: en
-  tgt:
-    path: ./dataset/retain99_${primary_target_language}
-    language: ${primary_target_language}
+# Multilingual retain/utility pools. These should not contain forget01 rows.
+retain_multi_path: ./dataset/retain99_merged_all_10_lang
+utility_multi_path: ./dataset/retain99_merged_all_10_lang
+parallel_anchor_path: ./dataset/retain99_merged_all_10_lang
 
 question_key: question
 answer_key: answer
 max_length: 500
-decontaminate_utility: true
+max_train_examples: null
 
+# Training
 lr: 2e-5
-batch_size: 2
+batch_size: 1
 gradient_accumulation_steps: 1
 num_epochs: 5
+max_steps: null
+warmup_ratio: 0.03
 weight_decay: 0.01
+max_grad_norm: 1.0
 seed: 42
-save_model: true
-save_merged_model: true
-eval_only: false
-eval_while_train: false
-save_dir: ./finetuned/${method_name}_${lr}_${split}_${num_epochs}_${primary_target_language}
 
-alpha: 1.0
-beta: 1.0
-gamma: 1.0
+# Precision and device placement. On Titan XP use fp16=true, bf16=false.
+bf16: false
+fp16: true
+gpu_train: 0
+gpu_ref: 1
 
+# Forget objective. `npo` is the default because it is tied to answer likelihood
+# while remaining more stable than pure negative CE.
+forget_objective: npo
+npo_beta: 1.0
+
+loss_weights:
+  forget: 1.0
+  retain_source_ce: 0.5
+  retain_multi_ce: 0.5
+  utility_multi_ce: 0.25
+  retain_source_kl: 0.1
+  retain_multi_kl: 0.1
+  utility_multi_kl: 0.0
+
+# Layer selection controls. `middle` is cheap and robust. Switch to
+# `hidden_alignment` to score source-target hidden similarity before LoRA attach.
+layer_selection:
+  strategy: middle  # manual | middle | hidden_alignment
+  selected_layers: null
+  top_k: 12
+  min_layer: 4
+  max_layer: null
+  hidden_alignment_batches: 8
+  hidden_alignment_batch_size: 1
+
+# PEFT LoRA. Selected-layer LoRA is the default update mechanism.
 use_lora: true
-lora_rank: 8
-lora_alpha: 16
+lora_r: 16
+lora_alpha: 32
 lora_dropout: 0.05
-lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
-full_finetune: false
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
 
-run_localization: true
-selected_layers_path: null
-localization_num_batches: 8
-select_top_k_layers: 8
-select_score_threshold: null
-score_mode: additive
-share_score_type: hidden
-share_eta: 1.0
-util_lambda: 1.0
-pooling: mean
-score_eps: 1e-12
+save_dir: ./finetuned/${method_name}_${forget_objective}_${lr}_${forget_split}_${num_epochs}_${source_language}
+lora_save_dir: ${save_dir}/lora_adapter
+save_merged_model: false
+merged_save_dir: ${save_dir}/merged
+overwrite_dir: false
+save_every_epoch: true
+log_steps: 5
+eval_only: false
 
-use_projection: true
-preserve_rank: 4
-max_preserve_batches: 8
-preserve_basis_path: null
-
-logging_steps: 10
-save_steps: null
-run_eval_after_train: false
-
-eval_after_train:
-  languages: [en, ar, fa, fr, hi, id, iw, ja, ko, ru]
-  language: en
-  split: ${split}_perturbed
-  english_data_path: ${forget_data_path}
-  data_root: ./dataset
-  save_dir: ${save_dir}/eval_results/multilingual
-  generation:
-    max_length: 200
-    max_new_tokens: 128
-  input_max_length: ${max_length}
-  unicode_normalization: NFC
-  normalize_languages:
-    - hi
-  save_generated_text: true
-  ds_size: null
-  overwrite: true
-  batch_size: 4
-  question_key: [question, question, question, question]
-  answer_key: [answer, answer, answer, answer]
-  base_answer_key: [paraphrased_answer, answer, answer, paraphrased_answer]
-  perturbed_answer_key: [perturbed_answer, perturbed_answer, perturbed_answer, perturbed_answer]
-  eval_task: [eval_log, eval_real_author_wo_options, eval_real_world_wo_options, eval_log_forget]
-  retain_result: null
-  retain_result_by_language: null
-  retain_result_template: null
-
+# Optional smoke/full eval command generation uses evaluate_util.py externally.
 eval:
-  jobs:
-    - language: en
-      save_dir: ${save_dir}/eval_results/en
-      data_path: [locuslab/TOFU, locuslab/TOFU, locuslab/TOFU, locuslab/TOFU]
-      split: ${split}_perturbed
-      split_list:
-        - retain_perturbed
-        - real_authors_perturbed
-        - world_facts_perturbed
-        - ${split}_perturbed
-      eval_task: [eval_log, eval_real_author_wo_options, eval_real_world_wo_options, eval_log_forget]
-      question_key: [question, question, question, question]
-      answer_key: [answer, answer, answer, answer]
-      base_answer_key: [paraphrased_answer, answer, answer, paraphrased_answer]
-      perturbed_answer_key: [perturbed_answer, perturbed_answer, perturbed_answer, perturbed_answer]
-      generation:
-        max_length: 200
-        max_new_tokens: null
-      save_generated_text: true
-      ds_size: null
-      overwrite: true
-      use_pretrained: false
-      batch_size: 4
-      retain_result: null
-    - language: ${primary_target_language}
-      save_dir: ${save_dir}/eval_results/${primary_target_language}
-      data_path:
-        - ./dataset/retain_perturbed_${primary_target_language}
-        - ./dataset/real_authors_perturbed_${primary_target_language}
-        - ./dataset/world_facts_perturbed_${primary_target_language}
-        - ./dataset/${split}_perturbed_${primary_target_language}
-      split: ${split}_perturbed
-      split_list:
-        - retain_perturbed
-        - real_authors_perturbed
-        - world_facts_perturbed
-        - ${split}_perturbed
-      eval_task: [eval_log, eval_real_author_wo_options, eval_real_world_wo_options, eval_log_forget]
-      question_key: [question, question, question, question]
-      answer_key: [answer, answer, answer, answer]
-      base_answer_key: [paraphrased_answer, answer, answer, paraphrased_answer]
-      perturbed_answer_key: [perturbed_answer, perturbed_answer, perturbed_answer, perturbed_answer]
-      generation:
-        max_length: 200
-        max_new_tokens: null
-      save_generated_text: true
-      ds_size: null
-      overwrite: true
-      use_pretrained: false
-      batch_size: 4
-      retain_result: null
+  languages: [en, ar, fa, fr, hi, id, iw, ja, ko, ru]
+  batch_size: 1
+  perturb_eval_chunk_size: 1
+  ds_size: null
+  save_case_studies: true
